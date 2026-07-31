@@ -14,12 +14,6 @@ pub fn parse_lenient(raw: Option<&str>) -> Option<DateTime<Utc>> {
 }
 
 /// `#[serde(with = "crate::timestamp::opt_rfc3339")]` for `Option<DateTime<Utc>>`.
-//
-// No wire type in this crate consumes it yet (that lands with the structs a
-// later task adds), so outside `#[cfg(test)]` these two functions are
-// currently unreferenced from the lib target; allow that until a consumer
-// exists rather than let dead-code lints block landing the mechanism itself.
-#[allow(dead_code)]
 pub mod opt_rfc3339 {
     use chrono::{DateTime, Utc};
     use serde::{Deserialize, Deserializer, Serializer};
