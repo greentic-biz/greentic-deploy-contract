@@ -9,7 +9,7 @@ repository = "https://github.com/greentic-biz/greentic-deploy-contract"
 
 [dependencies]
 serde = { version = "1.0.181", features = ["derive"] }
-chrono = { version = "0.4", default-features = false, features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
 
 [dev-dependencies]
 serde_json = "1"
