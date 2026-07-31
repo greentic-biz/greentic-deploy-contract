@@ -1,0 +1,15 @@
+[package]
+name = "greentic-deploy-contract"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+description = "Wire types for the Greentic admin → designer deploy and environment seam."
+repository = "https://github.com/greentic-biz/greentic-deploy-contract"
+
+[dependencies]
+serde = { version = "1.0.181", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
+
+[dev-dependencies]
+serde_json = "1"
