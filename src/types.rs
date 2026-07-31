@@ -24,11 +24,11 @@ pub struct EnvListItem {
     pub status: EnvStatus,
     pub status_detail: Option<String>,
     pub region: Option<String>,
-    #[serde(with = "crate::timestamp::opt_rfc3339")]
+    #[serde(default, with = "crate::timestamp::opt_rfc3339")]
     pub last_deployed_at: Option<DateTime<Utc>>,
-    #[serde(with = "crate::timestamp::opt_rfc3339")]
+    #[serde(default, with = "crate::timestamp::opt_rfc3339")]
     pub created_at: Option<DateTime<Utc>>,
-    #[serde(with = "crate::timestamp::opt_rfc3339")]
+    #[serde(default, with = "crate::timestamp::opt_rfc3339")]
     pub updated_at: Option<DateTime<Utc>>,
     /// True when BYOC credentials are stored. The credentials reference itself
     /// is server-only and is not part of this contract.
@@ -46,9 +46,9 @@ pub struct DeploymentJob {
     pub detail: Option<String>,
     /// Present once a deploy succeeds.
     pub endpoint: Option<String>,
-    #[serde(with = "crate::timestamp::opt_rfc3339")]
+    #[serde(default, with = "crate::timestamp::opt_rfc3339")]
     pub created_at: Option<DateTime<Utc>>,
-    #[serde(with = "crate::timestamp::opt_rfc3339")]
+    #[serde(default, with = "crate::timestamp::opt_rfc3339")]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -154,5 +154,53 @@ mod tests {
         assert_eq!(item.status, EnvStatus::Unknown("suspended".to_string()));
         assert_eq!(item.created_at, None);
         assert_eq!(item.name, "Production");
+    }
+
+    /// An admin build that predates one of these timestamp fields omits the
+    /// key entirely rather than sending it as `null`. `#[serde(with = ...)]`
+    /// disables serde's usual "a missing `Option<T>` field is `None`", so
+    /// without `#[serde(default, ...)]` this is a hard deserialize failure,
+    /// not a degraded value — the designer's own
+    /// `web/src/features/deploy-run/types.ts` already documents an admin in
+    /// the wild that omits `created_at`/`updated_at` on the job shape. Every
+    /// timestamp key omitted, not just one, so this is proof the whole
+    /// struct tolerates it, not just the field a narrower test would exercise.
+    #[test]
+    fn env_list_item_with_every_timestamp_key_omitted_still_deserializes() {
+        let item: EnvListItem = serde_json::from_value(serde_json::json!({
+            "id": "env_1",
+            "team_slug": null,
+            "name": "Production",
+            "target": "greentic_cloud",
+            "status": "live",
+            "status_detail": null,
+            "region": null,
+            "has_credentials": true
+        }))
+        .expect("missing timestamp keys must not fail the whole payload");
+
+        assert_eq!(item.last_deployed_at, None);
+        assert_eq!(item.created_at, None);
+        assert_eq!(item.updated_at, None);
+        assert_eq!(item.name, "Production");
+    }
+
+    /// See `env_list_item_with_every_timestamp_key_omitted_still_deserializes`
+    /// — same exposure, `DeploymentJob`'s two timestamp fields.
+    #[test]
+    fn deployment_job_with_every_timestamp_key_omitted_still_deserializes() {
+        let job: DeploymentJob = serde_json::from_value(serde_json::json!({
+            "id": "job_1",
+            "environment_id": "env_1",
+            "pack_ref": "acme.bundle@1.2.0",
+            "status": "running",
+            "detail": null,
+            "endpoint": null
+        }))
+        .expect("missing timestamp keys must not fail the whole payload");
+
+        assert_eq!(job.created_at, None);
+        assert_eq!(job.updated_at, None);
+        assert_eq!(job.status, JobStatus::Running);
     }
 }
