@@ -24,6 +24,16 @@ pub struct EnvListItem {
     pub status: EnvStatus,
     pub status_detail: Option<String>,
     pub region: Option<String>,
+    /// GCP project id for a Cloud Run target, taken from the environment's
+    /// operator-managed config. `None` for targets that need no project, and
+    /// for any admin older than this field.
+    ///
+    /// No `#[serde(default)]` is needed: serde's derive already yields `None`
+    /// for a missing plain `Option<T>` field. The sibling timestamp fields
+    /// carry the attribute because they use `with = "…"`, which does not get
+    /// that treatment — do not copy their pattern here on the assumption that
+    /// `Option` requires it.
+    pub project: Option<String>,
     #[serde(default, with = "crate::timestamp::opt_rfc3339")]
     pub last_deployed_at: Option<DateTime<Utc>>,
     #[serde(default, with = "crate::timestamp::opt_rfc3339")]
@@ -81,6 +91,7 @@ mod tests {
             "status": "live",
             "status_detail": null,
             "region": "ap-southeast-1",
+            "project": null,
             "last_deployed_at": "2026-07-30T10:00:00+00:00",
             "created_at": "2026-07-01T09:00:00+00:00",
             "updated_at": "2026-07-30T10:00:00+00:00",
@@ -202,5 +213,50 @@ mod tests {
         assert_eq!(job.created_at, None);
         assert_eq!(job.updated_at, None);
         assert_eq!(job.status, JobStatus::Running);
+    }
+
+    #[test]
+    fn env_list_item_without_project_reads_as_none() {
+        // An admin older than this field sends no `project` key. Deserialising
+        // must yield `None`, not fail — the crate exists so the two sides can
+        // ship independently, and the field's `Option<T>` type is what makes
+        // that true.
+        let json = serde_json::json!({
+            "id": "env_1",
+            "team_slug": "core",
+            "name": "Production",
+            "target": "gcp",
+            "status": "live",
+            "status_detail": null,
+            "region": "asia-southeast2",
+            "last_deployed_at": null,
+            "created_at": "2026-07-01T09:00:00+00:00",
+            "updated_at": "2026-07-30T10:00:00+00:00",
+            "has_credentials": true
+        });
+
+        let item: EnvListItem = serde_json::from_value(json).expect("older payload deserialises");
+        assert_eq!(item.project, None);
+    }
+
+    #[test]
+    fn env_list_item_carries_the_project_when_present() {
+        let json = serde_json::json!({
+            "id": "env_1",
+            "team_slug": "core",
+            "name": "Production",
+            "target": "gcp",
+            "status": "live",
+            "status_detail": null,
+            "region": "asia-southeast2",
+            "last_deployed_at": null,
+            "created_at": "2026-07-01T09:00:00+00:00",
+            "updated_at": "2026-07-30T10:00:00+00:00",
+            "has_credentials": true,
+            "project": "acme-prod-1234"
+        });
+
+        let item: EnvListItem = serde_json::from_value(json).expect("new payload deserialises");
+        assert_eq!(item.project.as_deref(), Some("acme-prod-1234"));
     }
 }
