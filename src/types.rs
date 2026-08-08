@@ -34,6 +34,16 @@ pub struct EnvListItem {
     /// that treatment — do not copy their pattern here on the assumption that
     /// `Option` requires it.
     pub project: Option<String>,
+    /// Artifact Registry repository that a Cloud Run deploy publishes bundles
+    /// into, taken from the environment's operator-managed config. `None` for
+    /// targets that need no registry, and for any admin older than this field.
+    ///
+    /// No `#[serde(default)]` is needed: serde's derive already yields `None`
+    /// for a missing plain `Option<T>` field. The sibling timestamp fields
+    /// carry the attribute because they use `with = "…"`, which does not get
+    /// that treatment — do not copy their pattern here on the assumption that
+    /// `Option` requires it.
+    pub repository: Option<String>,
     #[serde(default, with = "crate::timestamp::opt_rfc3339")]
     pub last_deployed_at: Option<DateTime<Utc>>,
     #[serde(default, with = "crate::timestamp::opt_rfc3339")]
@@ -92,6 +102,7 @@ mod tests {
             "status_detail": null,
             "region": "ap-southeast-1",
             "project": null,
+            "repository": null,
             "last_deployed_at": "2026-07-30T10:00:00+00:00",
             "created_at": "2026-07-01T09:00:00+00:00",
             "updated_at": "2026-07-30T10:00:00+00:00",
@@ -106,7 +117,9 @@ mod tests {
         assert!(item.updated_at.is_some());
 
         // Round-trips to exactly the payload it came from.
-        assert_eq!(serde_json::to_value(&item).unwrap(), json);
+        let obj = serde_json::to_value(&item).unwrap();
+        assert_eq!(obj, json);
+        assert_eq!(obj["repository"], serde_json::Value::Null);
     }
 
     #[test]
@@ -258,5 +271,51 @@ mod tests {
 
         let item: EnvListItem = serde_json::from_value(json).expect("new payload deserialises");
         assert_eq!(item.project.as_deref(), Some("acme-prod-1234"));
+    }
+
+    #[test]
+    fn env_list_item_without_repository_reads_as_none() {
+        // An admin that has not deployed this field yet simply omits the key.
+        // This is the ONLY thing pinning that tolerance — see the field's doc
+        // comment for why no `#[serde(default)]` is involved.
+        let json = serde_json::json!({
+            "id": "env_1",
+            "team_slug": null,
+            "name": "Prod",
+            "target": "gcp",
+            "status": "live",
+            "status_detail": null,
+            "region": "asia-southeast1",
+            "project": "acme-prod-1234",
+            "last_deployed_at": null,
+            "created_at": null,
+            "updated_at": null,
+            "has_credentials": true
+        });
+
+        let item: EnvListItem = serde_json::from_value(json).unwrap();
+        assert_eq!(item.repository, None);
+    }
+
+    #[test]
+    fn env_list_item_carries_the_repository_when_present() {
+        let json = serde_json::json!({
+            "id": "env_1",
+            "team_slug": null,
+            "name": "Prod",
+            "target": "gcp",
+            "status": "live",
+            "status_detail": null,
+            "region": "asia-southeast1",
+            "project": "acme-prod-1234",
+            "repository": "greentic",
+            "last_deployed_at": null,
+            "created_at": null,
+            "updated_at": null,
+            "has_credentials": true
+        });
+
+        let item: EnvListItem = serde_json::from_value(json).unwrap();
+        assert_eq!(item.repository.as_deref(), Some("greentic"));
     }
 }
