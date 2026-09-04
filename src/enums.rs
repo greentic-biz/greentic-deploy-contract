@@ -11,6 +11,7 @@ pub enum DeployTarget {
     Aws,
     Azure,
     Gcp,
+    K8s,
     /// A value this build does not know. Carries the original string so the UI
     /// can show what the server actually said, and so re-serializing does not
     /// corrupt it.
@@ -53,6 +54,7 @@ impl DeployTarget {
             "aws" => Self::Aws,
             "azure" => Self::Azure,
             "gcp" => Self::Gcp,
+            "k8s" => Self::K8s,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -95,10 +97,16 @@ mod tests {
             (DeployTarget::Aws, "\"aws\""),
             (DeployTarget::Azure, "\"azure\""),
             (DeployTarget::Gcp, "\"gcp\""),
+            (DeployTarget::K8s, "\"k8s\""),
         ] {
             assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
             assert_eq!(serde_json::from_str::<DeployTarget>(wire).unwrap(), variant);
         }
+    }
+
+    #[test]
+    fn from_wire_recognises_k8s() {
+        assert_eq!(DeployTarget::from_wire("k8s"), DeployTarget::K8s);
     }
 
     #[test]
