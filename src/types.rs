@@ -44,6 +44,24 @@ pub struct EnvListItem {
     /// that treatment — do not copy their pattern here on the assumption that
     /// `Option` requires it.
     pub repository: Option<String>,
+    /// How a Kubernetes environment's router Service is exposed —
+    /// `ClusterIP`, `NodePort` or `LoadBalancer` — taken from the
+    /// environment's operator-managed config. `None` for every non-K8s target,
+    /// for a K8s environment whose operator never chose one, and for any admin
+    /// older than this field.
+    ///
+    /// Carried as the operator's own string rather than an enum: it is
+    /// forwarded verbatim as `greentic-deployer`'s `service_type` wizard
+    /// answer, which matches case-insensitively and refuses an unknown value
+    /// itself. A second enum here would be a second copy of that vocabulary to
+    /// keep in step with a crate this one does not depend on.
+    ///
+    /// `None` must be read as the deployer's default (`ClusterIP`, in-cluster
+    /// only), never as a guess at an exposed type — exposing a Service is the
+    /// operator's decision, and it can put a load balancer on their bill.
+    ///
+    /// No `#[serde(default)]` is needed, for the same reason as `project`.
+    pub service_type: Option<String>,
     #[serde(default, with = "crate::timestamp::opt_rfc3339")]
     pub last_deployed_at: Option<DateTime<Utc>>,
     #[serde(default, with = "crate::timestamp::opt_rfc3339")]
@@ -103,6 +121,7 @@ mod tests {
             "region": "ap-southeast-1",
             "project": null,
             "repository": null,
+            "service_type": null,
             "last_deployed_at": "2026-07-30T10:00:00+00:00",
             "created_at": "2026-07-01T09:00:00+00:00",
             "updated_at": "2026-07-30T10:00:00+00:00",
@@ -120,6 +139,7 @@ mod tests {
         let obj = serde_json::to_value(&item).unwrap();
         assert_eq!(obj, json);
         assert_eq!(obj["repository"], serde_json::Value::Null);
+        assert_eq!(obj["service_type"], serde_json::Value::Null);
     }
 
     #[test]
@@ -317,5 +337,51 @@ mod tests {
 
         let item: EnvListItem = serde_json::from_value(json).unwrap();
         assert_eq!(item.repository.as_deref(), Some("greentic"));
+    }
+    #[test]
+    fn env_list_item_without_service_type_reads_as_none() {
+        // An admin that has not deployed this field yet simply omits the key,
+        // and `None` is what makes the deployer keep its in-cluster default.
+        let json = serde_json::json!({
+            "id": "env_1",
+            "team_slug": null,
+            "name": "Cluster",
+            "target": "k8s",
+            "status": "live",
+            "status_detail": null,
+            "region": null,
+            "project": null,
+            "repository": null,
+            "last_deployed_at": null,
+            "created_at": null,
+            "updated_at": null,
+            "has_credentials": true
+        });
+
+        let item: EnvListItem = serde_json::from_value(json).unwrap();
+        assert_eq!(item.service_type, None);
+    }
+
+    #[test]
+    fn env_list_item_carries_the_service_type_verbatim() {
+        let json = serde_json::json!({
+            "id": "env_1",
+            "team_slug": null,
+            "name": "Cluster",
+            "target": "k8s",
+            "status": "live",
+            "status_detail": null,
+            "region": null,
+            "project": null,
+            "repository": null,
+            "service_type": "LoadBalancer",
+            "last_deployed_at": null,
+            "created_at": null,
+            "updated_at": null,
+            "has_credentials": true
+        });
+
+        let item: EnvListItem = serde_json::from_value(json).unwrap();
+        assert_eq!(item.service_type.as_deref(), Some("LoadBalancer"));
     }
 }
