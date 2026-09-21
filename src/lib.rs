@@ -12,4 +12,4 @@ mod types;
 
 pub use enums::{DeployTarget, EnvStatus, JobStatus};
 pub use timestamp::parse_lenient;
-pub use types::{DeploymentJob, EnvListItem, RunnerStatus};
+pub use types::{DeploymentJob, EnvListItem, EnvOrigin, RunnerStatus};
