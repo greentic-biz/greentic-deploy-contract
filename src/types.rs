@@ -62,6 +62,30 @@ pub struct EnvListItem {
     ///
     /// No `#[serde(default)]` is needed, for the same reason as `project`.
     pub service_type: Option<String>,
+    /// Registry host (`host[:port]`) a Kubernetes environment's bundles are
+    /// pushed to and whose images its pods pull, from the environment's
+    /// operator-managed config. `None` for every non-k8s target, and for any
+    /// admin older than this field — in which case the designer falls back to
+    /// its own per-workspace store, which is where this value lived before.
+    ///
+    /// No `#[serde(default)]`: see `project` above.
+    pub k8s_registry: Option<String>,
+    /// Repository prefix under [`Self::k8s_registry`].
+    pub k8s_registry_repository: Option<String>,
+    /// Whether that registry is plain HTTP, as the operator's spelling of it
+    /// (`"true"`/`"false"`). A `String`, not a `bool`: a missing `bool` would
+    /// need `#[serde(default)]`, and the deployer parses the spelling itself,
+    /// so a second parser here would be a second opinion about what "true"
+    /// means.
+    pub k8s_registry_insecure: Option<String>,
+    /// Full image reference for the worker/router container, forwarded as
+    /// greentic-deployer's `runtime_image` answer. `None` keeps the
+    /// deployer's own default.
+    pub k8s_worker_image: Option<String>,
+    /// Full image reference for the init containers, forwarded as
+    /// greentic-deployer's `init_image` answer. `None` keeps the deployer's
+    /// own default.
+    pub k8s_init_image: Option<String>,
     #[serde(default, with = "crate::timestamp::opt_rfc3339")]
     pub last_deployed_at: Option<DateTime<Utc>>,
     #[serde(default, with = "crate::timestamp::opt_rfc3339")]
@@ -122,6 +146,11 @@ mod tests {
             "project": null,
             "repository": null,
             "service_type": null,
+            "k8s_registry": null,
+            "k8s_registry_repository": null,
+            "k8s_registry_insecure": null,
+            "k8s_worker_image": null,
+            "k8s_init_image": null,
             "last_deployed_at": "2026-07-30T10:00:00+00:00",
             "created_at": "2026-07-01T09:00:00+00:00",
             "updated_at": "2026-07-30T10:00:00+00:00",
@@ -140,6 +169,11 @@ mod tests {
         assert_eq!(obj, json);
         assert_eq!(obj["repository"], serde_json::Value::Null);
         assert_eq!(obj["service_type"], serde_json::Value::Null);
+        assert_eq!(obj["k8s_registry"], serde_json::Value::Null);
+        assert_eq!(obj["k8s_registry_repository"], serde_json::Value::Null);
+        assert_eq!(obj["k8s_registry_insecure"], serde_json::Value::Null);
+        assert_eq!(obj["k8s_worker_image"], serde_json::Value::Null);
+        assert_eq!(obj["k8s_init_image"], serde_json::Value::Null);
     }
 
     #[test]
@@ -383,5 +417,67 @@ mod tests {
 
         let item: EnvListItem = serde_json::from_value(json).unwrap();
         assert_eq!(item.service_type.as_deref(), Some("LoadBalancer"));
+    }
+
+    #[test]
+    fn env_list_item_without_the_k8s_registry_fields_reads_as_none() {
+        // An admin that predates these fields simply omits the keys, and
+        // `None` is what keeps the deployer on its own defaults.
+        let json = serde_json::json!({
+            "id": "env-1",
+            "team_slug": null,
+            "name": "prod",
+            "target": "k8s",
+            "status": "ready",
+            "status_detail": null,
+            "region": null,
+            "project": null,
+            "repository": null,
+            "service_type": null,
+            "last_deployed_at": null,
+            "created_at": null,
+            "updated_at": null,
+            "has_credentials": false
+        });
+        let item: EnvListItem = serde_json::from_value(json).unwrap();
+        assert_eq!(item.k8s_registry, None);
+        assert_eq!(item.k8s_registry_repository, None);
+        assert_eq!(item.k8s_registry_insecure, None);
+        assert_eq!(item.k8s_worker_image, None);
+        assert_eq!(item.k8s_init_image, None);
+    }
+
+    #[test]
+    fn env_list_item_round_trips_the_k8s_registry_fields() {
+        let json = serde_json::json!({
+            "id": "env-1",
+            "team_slug": null,
+            "name": "prod",
+            "target": "k8s",
+            "status": "ready",
+            "status_detail": null,
+            "region": null,
+            "project": null,
+            "repository": null,
+            "service_type": "ClusterIP",
+            "k8s_registry": "registry.client.local",
+            "k8s_registry_repository": "greentic",
+            "k8s_registry_insecure": "true",
+            "k8s_worker_image": "registry.client.local/greentic/greentic-start-distroless:1.2.3",
+            "k8s_init_image": "registry.client.local/greentic/busybox:1.36.1",
+            "last_deployed_at": null,
+            "created_at": null,
+            "updated_at": null,
+            "has_credentials": false
+        });
+        let item: EnvListItem = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(item.k8s_registry.as_deref(), Some("registry.client.local"));
+        assert_eq!(item.k8s_registry_insecure.as_deref(), Some("true"));
+        assert_eq!(
+            item.k8s_worker_image.as_deref(),
+            Some("registry.client.local/greentic/greentic-start-distroless:1.2.3")
+        );
+        let back = serde_json::to_value(&item).unwrap();
+        assert_eq!(back["k8s_init_image"], json["k8s_init_image"]);
     }
 }
