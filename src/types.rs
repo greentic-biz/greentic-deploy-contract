@@ -95,6 +95,26 @@ pub struct EnvListItem {
     /// True when BYOC credentials are stored. The credentials reference itself
     /// is server-only and is not part of this contract.
     pub has_credentials: bool,
+    /// Set when this environment is a partnership's environment projected into
+    /// the tenant: the partner configured it and the tenant may deploy to it
+    /// but not edit it. `None` means the tenant owns it — which is also what
+    /// every admin older than this field means.
+    ///
+    /// Skipped when `None` so every existing payload still round-trips
+    /// byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<EnvOrigin>,
+}
+
+/// Where a projected environment comes from. See [`EnvListItem::origin`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvOrigin {
+    pub partnership_id: String,
+    pub partnership_name: String,
+    /// True when the tenant can no longer deploy to it: it left the
+    /// partnership, or the partnership was disabled. A revoked environment is
+    /// still listed so a bound canvas can say why, and can be unbound.
+    pub revoked: bool,
 }
 
 /// An async deploy job for an environment, or for one unit within it.
@@ -479,5 +499,66 @@ mod tests {
         );
         let back = serde_json::to_value(&item).unwrap();
         assert_eq!(back["k8s_init_image"], json["k8s_init_image"]);
+    }
+
+    #[test]
+    fn env_list_item_without_origin_reads_as_none_and_omits_it_on_the_wire() {
+        // A tenant-owned environment, and every admin older than this field,
+        // sends no `origin` key. It must read as `None` — and must not be
+        // written back as `"origin": null`, or the round-trip test above
+        // stops being byte-for-byte for every existing payload.
+        let json = serde_json::json!({
+            "id": "env_1",
+            "team_slug": null,
+            "name": "Production",
+            "target": "gcp",
+            "status": "idle",
+            "status_detail": null,
+            "region": "asia-southeast1",
+            "last_deployed_at": null,
+            "created_at": null,
+            "updated_at": null,
+            "has_credentials": false
+        });
+        let item: EnvListItem = serde_json::from_value(json).expect("deserialises");
+        assert_eq!(item.origin, None);
+        let obj = serde_json::to_value(&item).unwrap();
+        assert!(
+            obj.get("origin").is_none(),
+            "None must be omitted, got {obj}"
+        );
+    }
+
+    #[test]
+    fn env_list_item_carries_a_partnership_origin() {
+        let json = serde_json::json!({
+            "id": "env_p",
+            "team_slug": null,
+            "name": "Acme Partner Cloud",
+            "target": "gcp",
+            "status": "idle",
+            "status_detail": null,
+            "region": "asia-southeast1",
+            "last_deployed_at": null,
+            "created_at": null,
+            "updated_at": null,
+            "has_credentials": true,
+            "origin": {
+                "partnership_id": "pship_1",
+                "partnership_name": "Acme",
+                "revoked": false
+            }
+        });
+        let item: EnvListItem = serde_json::from_value(json.clone()).expect("deserialises");
+        assert_eq!(
+            item.origin,
+            Some(EnvOrigin {
+                partnership_id: "pship_1".into(),
+                partnership_name: "Acme".into(),
+                revoked: false,
+            })
+        );
+        let obj = serde_json::to_value(&item).unwrap();
+        assert_eq!(obj["origin"], json["origin"]);
     }
 }
