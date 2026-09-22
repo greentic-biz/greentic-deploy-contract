@@ -115,6 +115,15 @@ pub struct EnvOrigin {
     /// partnership, or the partnership was disabled. A revoked environment is
     /// still listed so a bound canvas can say why, and can be unbound.
     pub revoked: bool,
+    /// The partnership marked this environment as the one its member tenants
+    /// use by default: pre-selected in pickers and bound to a new canvas. Never
+    /// true on a revoked origin. Absent (older admins) reads as false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub default: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !v
 }
 
 /// An async deploy job for an environment, or for one unit within it.
@@ -556,9 +565,29 @@ mod tests {
                 partnership_id: "pship_1".into(),
                 partnership_name: "Acme".into(),
                 revoked: false,
+                default: false,
             })
         );
         let obj = serde_json::to_value(&item).unwrap();
         assert_eq!(obj["origin"], json["origin"]);
+    }
+
+    #[test]
+    fn origin_without_default_reads_as_false() {
+        let o: EnvOrigin = serde_json::from_value(serde_json::json!({
+            "partnership_id": "p1", "partnership_name": "Acme", "revoked": false
+        }))
+        .unwrap();
+        assert!(!o.default);
+    }
+
+    #[test]
+    fn origin_default_round_trips() {
+        let json = serde_json::json!({
+            "partnership_id": "p1", "partnership_name": "Acme", "revoked": false, "default": true
+        });
+        let o: EnvOrigin = serde_json::from_value(json.clone()).unwrap();
+        assert!(o.default);
+        assert_eq!(serde_json::to_value(&o).unwrap(), json);
     }
 }
