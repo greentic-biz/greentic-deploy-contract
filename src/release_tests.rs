@@ -70,6 +70,52 @@ fn digest_changes_with_an_artifact_digest() {
 }
 
 #[test]
+fn digest_ignores_artifact_source_and_media_type() {
+    let a = sample();
+    let mut b = sample();
+    b.artifacts[0].source = Some("https://example.com/b.gtpack".into());
+    b.artifacts[0].media_type = Some("application/vnd.greentic.pack".into());
+    assert_eq!(release_digest(&a).ok(), release_digest(&b).ok());
+}
+
+fn sample_dependencies() -> Vec<DependencyPin> {
+    vec![
+        DependencyPin {
+            kind: DependencyKind::Extension,
+            name: "hubspot".into(),
+            version_req: Some(">=1.0.0".into()),
+            digest: Some(format!("sha256:{}", "d".repeat(64))),
+        },
+        DependencyPin {
+            kind: DependencyKind::Runtime,
+            name: "greentic-start".into(),
+            version_req: Some(">=1.2.0".into()),
+            digest: None,
+        },
+    ]
+}
+
+#[test]
+fn digest_is_order_independent_for_dependencies() {
+    let mut a = sample();
+    a.dependencies = sample_dependencies();
+    let mut b = sample();
+    b.dependencies = sample_dependencies();
+    b.dependencies.reverse();
+    assert_eq!(release_digest(&a).ok(), release_digest(&b).ok());
+}
+
+#[test]
+fn digest_changes_with_a_dependency_digest() {
+    let mut a = sample();
+    a.dependencies = sample_dependencies();
+    let mut b = sample();
+    b.dependencies = sample_dependencies();
+    b.dependencies[0].digest = Some(format!("sha256:{}", "e".repeat(64)));
+    assert_ne!(release_digest(&a).ok(), release_digest(&b).ok());
+}
+
+#[test]
 fn digest_is_prefixed_lower_hex() {
     let d = release_digest(&sample()).unwrap_or_default();
     assert!(d.starts_with("sha256:"));
@@ -174,8 +220,8 @@ fn abi_must_match_exactly() {
 
 #[test]
 fn request_round_trips_through_json() {
-    let s = serde_json::to_string(&sample()).unwrap_or_default();
-    let back: RegisterReleaseRequest = serde_json::from_str(&s).unwrap_or_else(|_| sample());
+    let s = serde_json::to_string(&sample()).expect("serialize");
+    let back: RegisterReleaseRequest = serde_json::from_str(&s).expect("deserialize");
     assert_eq!(back, sample());
     assert!(s.contains("\"kind\":\"application\""));
 }

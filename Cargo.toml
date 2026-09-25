@@ -16,4 +16,4 @@ semver = "1"
 
 [dev-dependencies]
 # Adds `Utc::now()` for tests only; the library itself stays clock-free.
-chrono = { version = "0.4", features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "alloc", "clock"] }
