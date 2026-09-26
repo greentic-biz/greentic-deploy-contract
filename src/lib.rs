@@ -1,4 +1,4 @@
-//! Wire types for the Greentic admin → designer deploy and environment seam.
+//! Wire types for the Greentic admin ↔ designer deploy, environment and release seam.
 //!
 //! This crate is types and serde only: no HTTP client, no database, no async.
 //! The designer's `admin/client` already owns retry, auth and its own error
@@ -13,3 +13,6 @@ mod types;
 pub use enums::{DeployTarget, EnvStatus, JobStatus};
 pub use timestamp::parse_lenient;
 pub use types::{DeploymentJob, EnvListItem, EnvOrigin, RunnerStatus};
+
+pub mod inventory;
+pub mod release;
