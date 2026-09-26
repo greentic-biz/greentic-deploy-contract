@@ -9,20 +9,20 @@ fn ts(hour: u32, min: u32, sec: u32) -> DateTime<Utc> {
 fn sufficient_report() -> UnitHealthReport {
     UnitHealthReport {
         unit_id: "unit-a".to_string(),
-        observed_revision: Some("web-00007-xyz".to_string()),
+        revision: Some("web-00007-xyz".to_string()),
         readiness: Readiness::Ready,
-        window_start: ts(12, 0, 0),
-        window_end: ts(13, 0, 0),
+        window_start: Some(ts(12, 0, 0)),
+        window_end: Some(ts(13, 0, 0)),
         requests: Some(RequestCounts {
             ok_2xx: 118,
             redirect_3xx: 0,
             client_4xx: 2,
             server_5xx: 0,
         }),
-        latency_ms: Some(Latency {
+        latency_ms: Latency {
             p50: Some(45.0),
             p99: Some(210.0),
-        }),
+        },
         server_error_rate: Some(0.0),
         idle: false,
         evidence: Evidence::Sufficient,
@@ -33,17 +33,22 @@ fn sufficient_report() -> UnitHealthReport {
 fn insufficient_report() -> UnitHealthReport {
     UnitHealthReport {
         unit_id: "unit-b".to_string(),
-        observed_revision: None,
+        revision: None,
         readiness: Readiness::Unknown,
-        window_start: ts(12, 0, 0),
-        window_end: ts(12, 0, 0),
+        window_start: None,
+        window_end: Some(ts(12, 0, 0)),
         requests: None,
-        latency_ms: None,
+        latency_ms: Latency::default(),
         server_error_rate: None,
         idle: false,
         evidence: Evidence::Insufficient {
             reason: InsufficientReason::NoRecordedRevision,
-            detail: Some("Designer recorded no revision for this unit's last deploy.".to_string()),
+            detail: Some(
+                "Designer recorded no Cloud Run revision for this unit's last deploy. \
+                 Deploy the environment again to record one."
+                    .to_string(),
+            ),
+            remediation: None,
         },
         reported_at: ts(12, 0, 1),
     }
@@ -72,20 +77,20 @@ fn wire_shape_of_a_sufficient_report_is_pinned() {
         value,
         json!({
             "unit_id": "unit-a",
-            "observed_revision": "web-00007-xyz",
-            "readiness": { "status": "ready" },
-            "window_start": "2026-09-26T12:00:00Z",
-            "window_end": "2026-09-26T13:00:00Z",
+            "revision": "web-00007-xyz",
+            "readiness": { "state": "ready" },
+            "windowStart": "2026-09-26T12:00:00Z",
+            "windowEnd": "2026-09-26T13:00:00Z",
             "requests": {
-                "ok_2xx": 118,
-                "redirect_3xx": 0,
-                "client_4xx": 2,
-                "server_5xx": 0
+                "ok2xx": 118,
+                "redirect3xx": 0,
+                "client4xx": 2,
+                "server5xx": 0
             },
-            "latency_ms": { "p50": 45.0, "p99": 210.0 },
-            "server_error_rate": 0.0,
+            "latencyMs": { "p50": 45.0, "p99": 210.0 },
+            "serverErrorRate": 0.0,
             "idle": false,
-            "evidence": { "kind": "sufficient" },
+            "evidence": { "state": "sufficient" },
             "reported_at": "2026-09-26T13:00:05Z"
         })
     );
@@ -98,18 +103,75 @@ fn wire_shape_of_an_insufficient_report_is_pinned() {
         value,
         json!({
             "unit_id": "unit-b",
-            "readiness": { "status": "unknown" },
-            "window_start": "2026-09-26T12:00:00Z",
-            "window_end": "2026-09-26T12:00:00Z",
+            "revision": null,
+            "readiness": { "state": "unknown" },
+            "windowStart": null,
+            "windowEnd": "2026-09-26T12:00:00Z",
+            "requests": null,
+            "latencyMs": { "p50": null, "p99": null },
+            "serverErrorRate": null,
             "idle": false,
             "evidence": {
-                "kind": "insufficient",
+                "state": "insufficient",
                 "reason": "no_recorded_revision",
-                "detail": "Designer recorded no revision for this unit's last deploy."
+                "detail": "Designer recorded no Cloud Run revision for this unit's last deploy. \
+                            Deploy the environment again to record one."
             },
             "reported_at": "2026-09-26T12:00:01Z"
         })
     );
+}
+
+/// A literal JSON body shaped exactly like the designer's own
+/// `orchestrate::env_deploy::unit_health::UnitHealth` — built from that
+/// module's struct definitions rather than copied from one pinning test,
+/// since no single test there pins the whole body (only
+/// `the_wire_names_the_reason_in_snake_case` and the `RequestCounts` case in
+/// `redirects_are_counted_and_uncounted_traffic_is_never_sufficient` each pin
+/// a slice of it). `unit_id` and `reported_at` are appended, as the two
+/// report-level fields the designer's reporting route adds on top.
+#[test]
+fn designer_unit_health_json_deserializes_unchanged() {
+    let body = json!({
+        "revision": null,
+        "readiness": { "state": "unknown" },
+        "windowStart": null,
+        "windowEnd": "2026-09-26T02:51:52Z",
+        "requests": null,
+        "latencyMs": { "p50": null, "p99": null },
+        "serverErrorRate": null,
+        "idle": false,
+        "evidence": {
+            "state": "insufficient",
+            "reason": "cannot_evaluate",
+            "detail": "x"
+        },
+        "unit_id": "unit-a",
+        "reported_at": "2026-09-26T02:51:52Z"
+    });
+
+    let report: UnitHealthReport = serde_json::from_value(body).unwrap();
+
+    assert_eq!(report.unit_id, "unit-a");
+    assert_eq!(report.revision, None);
+    assert_eq!(report.readiness, Readiness::Unknown);
+    assert_eq!(report.window_start, None);
+    assert_eq!(report.window_end, Some(ts(2, 51, 52)));
+    assert_eq!(report.requests, None);
+    assert_eq!(report.latency_ms, Latency::default());
+    assert_eq!(report.server_error_rate, None);
+    assert!(!report.idle);
+    assert_eq!(
+        report.evidence,
+        Evidence::Insufficient {
+            reason: InsufficientReason::CannotEvaluate,
+            detail: Some("x".to_string()),
+            remediation: None,
+        }
+    );
+    assert_eq!(report.reported_at, ts(2, 51, 52));
+    // No evidence claim to break — insufficient tolerates everything.
+    assert_eq!(report.validate(), Ok(()));
 }
 
 #[test]
@@ -120,7 +182,26 @@ fn wire_shape_of_a_not_ready_readiness_is_pinned() {
     .unwrap();
     assert_eq!(
         value,
-        json!({ "status": "not_ready", "reason": "container failed to start" })
+        json!({ "state": "not_ready", "reason": "container failed to start" })
+    );
+}
+
+#[test]
+fn wire_shape_of_insufficient_evidence_with_remediation_is_pinned() {
+    let value = serde_json::to_value(Evidence::Insufficient {
+        reason: InsufficientReason::CannotEvaluate,
+        detail: Some("Cloud Run refused reading the revision (HTTP 403).".to_string()),
+        remediation: Some("gcloud projects add-iam-policy-binding ...".to_string()),
+    })
+    .unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "state": "insufficient",
+            "reason": "cannot_evaluate",
+            "detail": "Cloud Run refused reading the revision (HTTP 403).",
+            "remediation": "gcloud projects add-iam-policy-binding ..."
+        })
     );
 }
 
@@ -135,10 +216,34 @@ fn a_valid_insufficient_report_validates() {
 }
 
 #[test]
+fn a_window_with_no_end_is_never_inverted() {
+    let mut report = sufficient_report();
+    report.window_end = None;
+    report.evidence = Evidence::Insufficient {
+        reason: InsufficientReason::Unavailable,
+        detail: None,
+        remediation: None,
+    };
+    assert_eq!(report.validate(), Ok(()));
+}
+
+#[test]
+fn a_window_with_no_start_is_never_inverted() {
+    let mut report = sufficient_report();
+    report.window_start = None;
+    report.evidence = Evidence::Insufficient {
+        reason: InsufficientReason::Unavailable,
+        detail: None,
+        remediation: None,
+    };
+    assert_eq!(report.validate(), Ok(()));
+}
+
+#[test]
 fn refuses_a_window_that_ends_before_it_starts() {
     let mut report = sufficient_report();
-    report.window_start = ts(13, 0, 0);
-    report.window_end = ts(12, 0, 0);
+    report.window_start = Some(ts(13, 0, 0));
+    report.window_end = Some(ts(12, 0, 0));
     assert_eq!(
         report.validate(),
         Err(UnitHealthReportError::WindowInverted)
@@ -203,6 +308,18 @@ fn request_counts_counted_sums_every_bucket() {
         server_5xx: 3,
     };
     assert_eq!(counts.counted(), 16);
+}
+
+#[test]
+fn request_counts_wire_shape_matches_the_designer_exactly() {
+    let counts = RequestCounts {
+        ok_2xx: 0,
+        redirect_3xx: 7,
+        client_4xx: 0,
+        server_5xx: 0,
+    };
+    let value = serde_json::to_value(counts).unwrap();
+    assert_eq!(value["redirect3xx"], 7);
 }
 
 #[test]

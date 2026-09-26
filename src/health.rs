@@ -3,40 +3,43 @@
 //!
 //! The designer computes this from its own runtime read (a Cloud Run
 //! readiness check plus a Cloud Monitoring window); the admin's rollout view
-//! renders it beside target selection. Both sides must agree on the shape,
-//! which is why it lives here rather than being re-derived independently on
-//! either side.
+//! renders it beside target selection. The designer's reporting route is
+//! already reviewed and sends its existing `orchestrate::env_deploy::
+//! unit_health::UnitHealth` JSON unchanged, and the admin stores whatever it
+//! receives — so this type mirrors that JSON **field for field, including
+//! its casing**, rather than picking a shape of its own that a translation
+//! layer would then have to bridge.
 //!
-//! This mirrors the designer's internal `orchestrate::env_deploy::unit_health`
-//! model, with four deliberate departures, recorded so a future reader does
-//! not "fix" this type back into disagreement with what the designer already
-//! ships:
+//! Only two things here are NOT part of `UnitHealth` itself:
 //!
-//! - [`Readiness`] and [`Evidence`] tag on `status` and `kind` respectively,
-//!   not the designer's internal `state` for both — this contract already
-//!   tags its other enums by what they discriminate (see
-//!   [`crate::governance::GateStatus`]'s `status`, `CompatVerdict`'s
-//!   `verdict` in [`crate::release`]), and reusing one tag name for two
-//!   different nested enums invites a reader to assume they share a
-//!   vocabulary when they do not.
-//! - [`Evidence::Insufficient`] carries no `remediation` field. The
-//!   designer's internal type adds one so its own UI can offer a ready-to-run
-//!   `gcloud` fix; the admin's rollout view has no use for it here.
-//! - `window_start` / `window_end` are required [`DateTime<Utc>`], not the
-//!   designer's optional RFC 3339 strings — a report is only ever sent for a
-//!   window that was actually established.
-//! - `latency_ms` is `Option<`[`Latency`]`>`; the designer keeps an
-//!   always-present struct whose two fields default to `None` instead.
+//! - `unit_id` and `reported_at` are report-level additions — the envelope
+//!   the designer wraps a `UnitHealth` reading in before sending it. They
+//!   stay in this crate's own snake_case convention (matching
+//!   [`crate::inventory::DeploymentUnitRecord`]'s `unit_id` / `reported_at`),
+//!   since there is no existing designer JSON for them to match.
+//! - `window_end` is `Option<DateTime<Utc>>` here, though the designer's own
+//!   `UnitHealth.window_end` is a required string. A report is only ever
+//!   built from an already-established window today, so the two agree in
+//!   practice; keeping it optional at the contract level means a future
+//!   caller that reports before a window exists is a valid message, not an
+//!   `Err`, and it makes both ends of the window symmetric.
 //!
-//! Everything else — field names, the closed [`InsufficientReason`] set, the
-//! four request-count buckets — matches the designer's model exactly.
+//! Everything else — `revision`, the `state`-tagged `readiness` and
+//! `evidence`, the `windowStart` / `latencyMs` / `serverErrorRate` casing,
+//! the four `RequestCounts` buckets, and `evidence.remediation` — is copied
+//! from the designer's struct definitions verbatim, so a JSON body the
+//! designer already produces deserializes here unchanged (see the
+//! `designer_unit_health_json_deserializes_unchanged` test, built from the
+//! designer's own `unit_health.rs` field definitions since no single test
+//! there pins the whole body).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Whether Cloud Run reports the revision ready.
+/// Whether Cloud Run reports the revision ready. Field-for-field identical to
+/// the designer's `unit_health::Readiness`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum Readiness {
     Ready,
     NotReady {
@@ -66,8 +69,10 @@ pub enum InsufficientReason {
 
 /// Whether a report is enough to judge the unit. `Sufficient` is a claim
 /// [`UnitHealthReport::validate`] checks, not just a label — see its rules.
+/// Field-for-field identical to the designer's `unit_health::Evidence`,
+/// `remediation` included.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum Evidence {
     Sufficient,
     Insufficient {
@@ -75,6 +80,9 @@ pub enum Evidence {
         /// A sentence for the operator.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// The ready-to-run fix, when the refusal carries one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remediation: Option<String>,
     },
 }
 
@@ -86,6 +94,7 @@ pub enum Evidence {
 /// that could not happen at all — no recorded revision, a refused API call,
 /// an unreachable runtime — reports `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RequestCounts {
     pub ok_2xx: u64,
     /// Counted separately from `ok_2xx`: a redirect is traffic the revision
@@ -124,26 +133,32 @@ pub struct Latency {
 /// cannot claim `Sufficient` any other way.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UnitHealthReport {
+    /// Report-level addition; not part of the designer's `UnitHealth`.
     pub unit_id: String,
     /// The revision this report is about. `None` when the designer has no
     /// recorded revision for the unit at all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observed_revision: Option<String>,
+    #[serde(default)]
+    pub revision: Option<String>,
     pub readiness: Readiness,
-    pub window_start: DateTime<Utc>,
-    pub window_end: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "windowStart", default)]
+    pub window_start: Option<DateTime<Utc>>,
+    /// See the module doc: optional here even though the designer's own
+    /// `window_end` is a required string.
+    #[serde(rename = "windowEnd", default)]
+    pub window_end: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub requests: Option<RequestCounts>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latency_ms: Option<Latency>,
+    #[serde(rename = "latencyMs", default)]
+    pub latency_ms: Latency,
     /// `server_5xx / all requests`, `None` when there were none to divide by.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "serverErrorRate", default)]
     pub server_error_rate: Option<f64>,
     /// True only when traffic was MEASURED as zero — never a stand-in for
     /// "not measured"; see `requests`.
     pub idle: bool,
     pub evidence: Evidence,
-    /// When the designer produced this report — not the window it describes.
+    /// Report-level addition; not part of the designer's `UnitHealth`. When
+    /// the designer produced this report — not the window it describes.
     pub reported_at: DateTime<Utc>,
 }
 
@@ -151,7 +166,7 @@ pub struct UnitHealthReport {
 /// one of these; nothing here panics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnitHealthReportError {
-    /// `window_end` is before `window_start`.
+    /// `window_end` is before `window_start`, when both are known.
     WindowInverted,
     /// `evidence` claims `Sufficient` over a `readiness` that is not `Ready`.
     SufficientWithoutReadyRevision,
@@ -186,7 +201,9 @@ impl UnitHealthReport {
     /// Refuse a report that contradicts itself. See [`UnitHealthReportError`]
     /// for the rules; never panics.
     pub fn validate(&self) -> Result<(), UnitHealthReportError> {
-        if self.window_end < self.window_start {
+        if let (Some(start), Some(end)) = (self.window_start, self.window_end)
+            && end < start
+        {
             return Err(UnitHealthReportError::WindowInverted);
         }
         if matches!(self.evidence, Evidence::Sufficient) {
