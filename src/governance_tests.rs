@@ -365,11 +365,26 @@ fn fleet(n: usize) -> Vec<String> {
 
 #[test]
 fn raising_the_target_extends_the_prefix() {
-    let order = order_units("ro-1", "seed", &fleet(200));
-    let five = bps_select(order.len(), 500).count;
-    let ten = bps_select(order.len(), 1_000).count;
+    // The first selection is taken from one freeze, the second from a
+    // re-freeze of the same audience fed in a different order: the earlier
+    // cohort must survive intact and the new units must follow it.
+    let first = order_units("ro-1", "seed", &fleet(200));
+    let mut shuffled = fleet(200);
+    shuffled.reverse();
+    shuffled.rotate_left(37);
+    let second = order_units("ro-1", "seed", &shuffled);
+    let five = bps_select(first.len(), 500).count;
+    let ten = bps_select(second.len(), 1_000).count;
     assert_eq!((five, ten), (10, 20));
-    assert_eq!(order[..five], order[..ten][..five]);
+    assert_eq!(first[..five], second[..five]);
+    let earlier: BTreeSet<&String> = first[..five].iter().collect();
+    assert!(second[five..ten].iter().all(|u| !earlier.contains(u)));
+    // And the order really is the sort-key order, not the input order.
+    let keys: Vec<String> = second[..ten]
+        .iter()
+        .map(|u| sort_key("ro-1", "seed", u))
+        .collect();
+    assert!(keys.windows(2).all(|w| w[0] <= w[1]));
 }
 
 #[test]
@@ -384,10 +399,14 @@ fn ordering_ignores_input_order() {
 
 #[test]
 fn the_canary_is_the_first_unit_of_the_stable_order() {
-    let order = order_units("ro-1", "seed", &fleet(20));
+    let units = fleet(20);
+    let order = order_units("ro-1", "seed", &units);
     assert!(bps_select(order.len(), 10).rounds_to_zero);
-    let canary = &order[..1];
-    assert_eq!(canary, &order_units("ro-1", "seed", &fleet(20))[..1]);
+    let minimum = units
+        .iter()
+        .min_by_key(|u| sort_key("ro-1", "seed", u))
+        .cloned();
+    assert_eq!(order.first().cloned(), minimum);
 }
 
 #[test]

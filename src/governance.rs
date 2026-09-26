@@ -6,7 +6,7 @@
 //! rollout is authorised" and "these units are selected" mean, so the rules
 //! live in the contract rather than in any one consumer.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -34,12 +34,15 @@ pub enum PolicyMode {
     Manual,
 }
 
-/// One scope's approval policy. The caller supplies at most one row per
+/// One scope's approval policy. The caller may pass a scope's history:
+/// [`evaluate_gates`] keeps only the highest `generation` per
 /// `(scope_kind, scope_id)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleasePolicy {
     pub scope_kind: ScopeKind,
-    /// `None` for the platform scope.
+    /// `None` for the platform scope, `Some(non-empty id)` otherwise. Not
+    /// validated here: the writer must normalise, because scopes are matched
+    /// by exact equality and a mismatch is silently a different scope.
     #[serde(default)]
     pub scope_id: Option<String>,
     pub mode: PolicyMode,
@@ -60,11 +63,17 @@ pub enum Decision {
 /// A recorded decision. It binds to everything that makes it meaningful: a
 /// change to any of these fields is a different request that needs its own
 /// decision.
+///
+/// Decisions are an append-only log per scope: the LATEST matching one
+/// (`decided_at`, then `approval_id`) is the scope's state, so recording
+/// `Approved` after a `Hold` or `Rejected` lifts it, and recording `Hold`
+/// after `Approved` blocks again. See [`evaluate_gates`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRecord {
     pub approval_id: String,
     pub rollout_id: String,
     pub scope_kind: ScopeKind,
+    /// Same normalisation as [`ReleasePolicy::scope_id`].
     #[serde(default)]
     pub scope_id: Option<String>,
     /// `sha256:<64 lowercase hex>`.
@@ -82,17 +91,18 @@ pub struct ApprovalRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum GateStatus {
-    /// This scope's manual gate has a current approval.
+    /// This scope's manual gate: its latest matching decision is `Approved`.
     Satisfied {
         scope_kind: ScopeKind,
         scope_id: Option<String>,
     },
-    /// This scope's manual gate has no current approval.
+    /// This scope's manual gate has no matching decision yet.
     Pending {
         scope_kind: ScopeKind,
         scope_id: Option<String>,
     },
-    /// A current rejection or hold at this scope, whatever its policy mode.
+    /// This scope's latest matching decision is a rejection or hold,
+    /// whatever its policy mode.
     Blocked {
         scope_kind: ScopeKind,
         scope_id: Option<String>,
@@ -100,32 +110,38 @@ pub enum GateStatus {
     },
 }
 
-impl GateStatus {
-    fn scope_kind(&self) -> ScopeKind {
-        match self {
-            GateStatus::Satisfied { scope_kind, .. }
-            | GateStatus::Pending { scope_kind, .. }
-            | GateStatus::Blocked { scope_kind, .. } => *scope_kind,
-        }
-    }
-}
-
 /// Evaluate every approval gate for one request (§3).
 ///
-/// Each `Manual` policy yields exactly one gate, `Satisfied` or `Pending`,
-/// and only an approval AT THAT SCOPE can satisfy it — which is why a lower
-/// `Auto` policy structurally cannot bypass a higher manual gate. An approval
-/// counts only when its release digest, target scope digest, operation set
-/// and policy generation all match the request and the scope's current
-/// policy.
+/// **Policies are normalised first.** Only the newest row per
+/// `(scope_kind, scope_id)` — the highest `generation` — counts; older rows
+/// are history, so passing a scope's full policy history is safe.
 ///
-/// Independently, a `Rejected` or `Hold` decision at ANY scope that matches
-/// the request yields `Blocked`. Its generation must equal that scope's
-/// current policy generation; a scope with no policy row has no generation to
-/// supersede it, so any generation counts there.
+/// **Each scope's state is its LATEST matching decision.** A decision
+/// matches when its release digest, target scope digest and operation set
+/// equal the request's (operations compared as a set), and its
+/// `policy_generation` equals the scope's current generation. A scope with
+/// no policy row has no generation to supersede a decision, so there any
+/// generation matches. Among the matching decisions of one scope, the one
+/// with the highest `decided_at` wins; on a tie, the higher `approval_id`.
 ///
-/// Output is ordered platform, partnership, tenant; within a scope the gate
-/// precedes its blocks. Approval order in the input never matters.
+/// - `Approved` means the scope agrees. A later `Approved` therefore
+///   RELEASES an earlier `Hold` or `Rejected` from the same scope — the same
+///   authority reversed its decision — and a later `Hold` blocks again.
+/// - `Rejected` or `Hold` yields `Blocked` at any level, whatever the scope's
+///   policy mode. There is no bypass.
+///
+/// A `Manual` scope yields exactly one entry: `Satisfied` (latest is
+/// `Approved`), `Blocked` (latest is `Rejected`/`Hold`) or `Pending` (no
+/// matching decision). An `Auto` scope, or one with no policy row, yields an
+/// entry only when its latest matching decision blocks. Only a decision AT a
+/// scope can satisfy that scope's manual gate, which is why a lower `Auto`
+/// policy structurally cannot bypass a higher manual gate.
+///
+/// An empty `operations` request binds only to decisions with an empty
+/// operation set; callers should never send one.
+///
+/// Output holds at most one entry per scope, ordered platform, partnership,
+/// tenant, then by `scope_id`. Input order never matters.
 pub fn evaluate_gates(
     policies: &[ReleasePolicy],
     approvals: &[ApprovalRecord],
@@ -133,92 +149,72 @@ pub fn evaluate_gates(
     target_scope_digest: &str,
     operations: &[String],
 ) -> Vec<GateStatus> {
+    type Scope = (ScopeKind, Option<String>);
+
+    let mut current: BTreeMap<Scope, &ReleasePolicy> = BTreeMap::new();
+    for p in policies {
+        let key = (p.scope_kind, p.scope_id.clone());
+        let newer = current
+            .get(&key)
+            .is_none_or(|existing| p.generation > existing.generation);
+        if newer {
+            current.insert(key, p);
+        }
+    }
+
     let requested_ops: BTreeSet<&str> = operations.iter().map(String::as_str).collect();
-    let binds = |a: &ApprovalRecord| {
-        a.release_digest == release_digest
+    let mut latest: BTreeMap<Scope, &ApprovalRecord> = BTreeMap::new();
+    for a in approvals {
+        let key = (a.scope_kind, a.scope_id.clone());
+        let binds = a.release_digest == release_digest
             && a.target_scope_digest == target_scope_digest
             && a.operations
                 .iter()
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>()
                 == requested_ops
-    };
-    let current_generation = |kind: ScopeKind, id: &Option<String>| {
-        policies
-            .iter()
-            .filter(|p| p.scope_kind == kind && &p.scope_id == id)
-            .map(|p| p.generation)
-            .max()
-    };
-
-    let mut gates = Vec::new();
-    for p in policies.iter().filter(|p| p.mode == PolicyMode::Manual) {
-        let approved = approvals.iter().any(|a| {
-            a.decision == Decision::Approved
-                && a.scope_kind == p.scope_kind
-                && a.scope_id == p.scope_id
-                && a.policy_generation == p.generation
-                && binds(a)
-        });
-        let scope_kind = p.scope_kind;
-        let scope_id = p.scope_id.clone();
-        gates.push(if approved {
-            GateStatus::Satisfied {
-                scope_kind,
-                scope_id,
-            }
-        } else {
-            GateStatus::Pending {
-                scope_kind,
-                scope_id,
-            }
-        });
-    }
-
-    let mut blocks: Vec<GateStatus> = Vec::new();
-    for a in approvals {
-        if a.decision == Decision::Approved || !binds(a) {
+            && current
+                .get(&key)
+                .is_none_or(|p| p.generation == a.policy_generation);
+        if !binds {
             continue;
         }
-        let current = current_generation(a.scope_kind, &a.scope_id);
-        if current.is_some_and(|g| g != a.policy_generation) {
-            continue;
-        }
-        let block = GateStatus::Blocked {
-            scope_kind: a.scope_kind,
-            scope_id: a.scope_id.clone(),
-            decision: a.decision,
-        };
-        if !blocks.contains(&block) {
-            blocks.push(block);
+        let newer = latest.get(&key).is_none_or(|prev| {
+            (a.decided_at, a.approval_id.as_str()) > (prev.decided_at, prev.approval_id.as_str())
+        });
+        if newer {
+            latest.insert(key, a);
         }
     }
-    // Deterministic regardless of the order approvals arrived in.
-    blocks.sort_by(|x, y| block_key(x).cmp(&block_key(y)));
-    gates.extend(blocks);
 
-    // Stable: a scope's gate stays ahead of its blocks.
-    gates.sort_by_key(GateStatus::scope_kind);
-    gates
-}
-
-fn block_key(g: &GateStatus) -> (ScopeKind, Option<&str>, u8) {
-    match g {
-        GateStatus::Blocked {
-            scope_kind,
-            scope_id,
-            decision,
-        } => (
-            *scope_kind,
-            scope_id.as_deref(),
-            match decision {
-                Decision::Approved => 0,
-                Decision::Rejected => 1,
-                Decision::Hold => 2,
-            },
-        ),
-        other => (other.scope_kind(), None, 0),
-    }
+    let scopes: BTreeSet<&Scope> = current.keys().chain(latest.keys()).collect();
+    scopes
+        .into_iter()
+        .filter_map(|scope| {
+            let (scope_kind, scope_id) = (scope.0, scope.1.clone());
+            let manual = current
+                .get(scope)
+                .is_some_and(|p| p.mode == PolicyMode::Manual);
+            match latest.get(scope).map(|a| a.decision) {
+                Some(decision @ (Decision::Rejected | Decision::Hold)) => {
+                    Some(GateStatus::Blocked {
+                        scope_kind,
+                        scope_id,
+                        decision,
+                    })
+                }
+                Some(Decision::Approved) if manual => Some(GateStatus::Satisfied {
+                    scope_kind,
+                    scope_id,
+                }),
+                None if manual => Some(GateStatus::Pending {
+                    scope_kind,
+                    scope_id,
+                }),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Authorised only when no manual gate is pending and nothing blocks.
@@ -278,6 +274,10 @@ pub fn sort_key(rollout_id: &str, cohort_seed: &str, unit_key: &str) -> String {
     hex_lower(&h.finalize())
 }
 
+/// Unit keys passed to this, [`audience_digest`] and [`target_scope_digest`]
+/// must be non-empty, free of `\n` (the digests join on it without escaping)
+/// and deduplicated by the caller; none of this is re-checked here.
+///
 /// Sort an audience into its stable order: by `(sort_key, unit_key)`, so the
 /// input order never matters. Raising the target extends a prefix of this
 /// order; the first element is the explicit canary.
@@ -320,3 +320,7 @@ fn digest_joined<'a>(keys: impl Iterator<Item = &'a str>) -> String {
 #[cfg(test)]
 #[path = "governance_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "governance_decision_tests.rs"]
+mod decision_tests;
