@@ -182,7 +182,7 @@ pub fn sha256_prefixed(input: &str) -> Option<String> {
         .then(|| format!("sha256:{}", hex.to_ascii_lowercase()))
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes
         .iter()
