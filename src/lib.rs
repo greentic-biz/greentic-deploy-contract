@@ -15,5 +15,6 @@ pub use timestamp::parse_lenient;
 pub use types::{DeploymentJob, EnvListItem, EnvOrigin, RunnerStatus};
 
 pub mod governance;
+pub mod health;
 pub mod inventory;
 pub mod release;
