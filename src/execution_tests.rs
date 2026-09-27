@@ -165,6 +165,35 @@ fn digests_must_be_canonical_sha256() {
 }
 
 #[test]
+fn an_update_requires_a_target_bundle_digest() {
+    let mut a = sample();
+    a.units[0].target.bundle_digest = None;
+    assert_eq!(
+        a.validate(),
+        Err(ValidationError::MissingTargetDigest(
+            "env:bundle-a".to_string()
+        ))
+    );
+    a.operation = ExecOperation::Rollback;
+    assert_eq!(a.validate(), Ok(()));
+}
+
+#[test]
+fn identifiers_with_surrounding_whitespace_are_refused() {
+    let mut a = sample();
+    let mut dup = a.units[0].clone();
+    dup.unit_id = "env:bundle-a ".to_string();
+    a.units.push(dup);
+    assert_eq!(a.validate(), Err(ValidationError::BadIdentifier("unit_id")));
+    let mut a = sample();
+    a.tenant_id = " acme".to_string();
+    assert_eq!(
+        a.validate(),
+        Err(ValidationError::BadIdentifier("tenant_id"))
+    );
+}
+
+#[test]
 fn a_not_previously_deployed_baseline_is_valid() {
     let mut a = sample();
     a.units[0].expected_baseline = UnitBaseline::default();
@@ -261,6 +290,12 @@ fn checkpoint_rules() {
     let mut c = checkpoint();
     c.reason = Some("Baseline Changed".to_string());
     assert_eq!(c.validate(), Err(CheckpointError::BadReason));
+
+    let mut c = checkpoint();
+    c.reason = Some("a".repeat(MAX_CHECKPOINT_REASON_BYTES + 1));
+    assert_eq!(c.validate(), Err(CheckpointError::BadReason));
+    c.reason = Some("a".repeat(MAX_CHECKPOINT_REASON_BYTES));
+    assert_eq!(c.validate(), Ok(()));
 
     let mut c = checkpoint();
     c.detail = Some("x".repeat(MAX_CHECKPOINT_DETAIL_CHARS + 1));

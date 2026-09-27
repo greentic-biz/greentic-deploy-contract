@@ -66,6 +66,38 @@ mod signing {
     };
     use crate::release::hex_lower;
 
+    /// The most signatures [`verify`] will look at. Each one costs up to
+    /// `trusted.len()` Ed25519 verifications, so an envelope carrying more is
+    /// refused outright rather than verified.
+    pub const MAX_SIGNATURES: usize = 8;
+
+    /// Why [`sign`] refused to sign.
+    #[derive(Debug)]
+    pub enum SignError {
+        /// The authorisation fails [`ExecutionAuthorisation::validate`]; every
+        /// receiver would refuse it, so it is never signed.
+        Invalid(ValidationError),
+        Serialize(serde_json::Error),
+    }
+
+    impl std::fmt::Display for SignError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Invalid(e) => write!(f, "refusing to sign an invalid authorisation: {e}"),
+                Self::Serialize(e) => write!(f, "could not serialise the authorisation: {e}"),
+            }
+        }
+    }
+
+    impl std::error::Error for SignError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Invalid(e) => Some(e),
+                Self::Serialize(e) => Some(e),
+            }
+        }
+    }
+
     /// Why [`verify`] refused an envelope. Each is a distinct outcome so a
     /// receiver can report a distinct reason code.
     #[derive(Debug)]
@@ -74,6 +106,8 @@ mod signing {
         WrongPayloadType,
         /// `payload` is not valid standard base64.
         BadEncoding,
+        /// The envelope carries more than [`MAX_SIGNATURES`] signatures.
+        TooManySignatures,
         /// No signature verifies under any trusted key (including: no
         /// trusted key configured, or no signatures at all).
         NoTrustedSignature,
@@ -89,6 +123,9 @@ mod signing {
             match self {
                 Self::WrongPayloadType => f.write_str("wrong DSSE payload type"),
                 Self::BadEncoding => f.write_str("payload is not valid base64"),
+                Self::TooManySignatures => {
+                    write!(f, "envelope carries more than {MAX_SIGNATURES} signatures")
+                }
                 Self::NoTrustedSignature => f.write_str("no signature from a trusted key"),
                 Self::BadPayload(e) => write!(f, "payload is not a v1 authorisation: {e}"),
                 Self::Invalid(e) => write!(f, "authorisation is invalid: {e}"),
@@ -141,16 +178,20 @@ mod signing {
         hex
     }
 
-    /// Sign `auth` as a DSSE envelope. The payload is `serde_json::to_vec` of
-    /// the struct, whose field order is fixed by its declaration.
+    /// Validate, then sign `auth` as a DSSE envelope. The payload is
+    /// `serde_json::to_vec` of the struct, whose field order is fixed by its
+    /// declaration.
     ///
-    /// Serialising these types cannot fail (no maps with non-string keys, no
-    /// custom serializers), but the error is returned rather than assumed.
+    /// An authorisation that fails [`ExecutionAuthorisation::validate`] is
+    /// refused here rather than surfacing as `Invalid` on every receiver.
+    /// Serialising these types cannot fail in practice, but the error is
+    /// returned rather than assumed.
     pub fn sign(
         auth: &ExecutionAuthorisation,
         key: &SigningKey,
-    ) -> Result<DsseEnvelope, serde_json::Error> {
-        let payload = serde_json::to_vec(auth)?;
+    ) -> Result<DsseEnvelope, SignError> {
+        auth.validate().map_err(SignError::Invalid)?;
+        let payload = serde_json::to_vec(auth).map_err(SignError::Serialize)?;
         let signature = key.sign(&pae(EXECUTION_AUTHORISATION_PAYLOAD_TYPE, &payload));
         Ok(DsseEnvelope {
             payload_type: EXECUTION_AUTHORISATION_PAYLOAD_TYPE.to_string(),
@@ -175,6 +216,9 @@ mod signing {
         let payload = STANDARD
             .decode(env.payload.as_bytes())
             .map_err(|_| VerifyError::BadEncoding)?;
+        if env.signatures.len() > MAX_SIGNATURES {
+            return Err(VerifyError::TooManySignatures);
+        }
         let message = pae(&env.payload_type, &payload);
         let signed_by_trusted = env.signatures.iter().any(|s| {
             // A malformed signature is simply not a trusted one; it must not

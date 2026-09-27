@@ -71,7 +71,8 @@ mod signing {
         let k = key(1);
         let mut env = sign(&sample(), &k).unwrap();
         let mut bytes = STANDARD.decode(&env.payload).unwrap();
-        // Flip a byte inside a digest so the JSON stays well-formed.
+        // The flipped byte may or may not leave well-formed JSON; either way
+        // the signature is checked BEFORE parsing, which is what this pins.
         let pos = bytes.len() / 2;
         bytes[pos] ^= 0x01;
         env.payload = STANDARD.encode(&bytes);
@@ -162,7 +163,7 @@ mod signing {
         let k = key(1);
         let mut a = sample();
         a.schema = "greentic.execution-authorisation.v9".to_string();
-        let env = sign(&a, &k).unwrap();
+        let env = sign_raw(&serde_json::to_vec(&a).unwrap(), &k);
         assert!(matches!(
             verify(&env, &[k.verifying_key()]),
             Err(VerifyError::Invalid(ValidationError::UnknownSchema(_)))
@@ -174,7 +175,7 @@ mod signing {
         let k = key(1);
         let mut a = sample();
         a.traffic.steps = vec![50, 10];
-        let env = sign(&a, &k).unwrap();
+        let env = sign_raw(&serde_json::to_vec(&a).unwrap(), &k);
         assert!(matches!(
             verify(&env, &[k.verifying_key()]),
             Err(VerifyError::Invalid(ValidationError::BadTrafficSteps))
@@ -186,11 +187,44 @@ mod signing {
         let k = key(1);
         let mut a = sample();
         a.units.push(a.units[0].clone());
-        let env = sign(&a, &k).unwrap();
+        let env = sign_raw(&serde_json::to_vec(&a).unwrap(), &k);
         assert!(matches!(
             verify(&env, &[k.verifying_key()]),
             Err(VerifyError::Invalid(ValidationError::DuplicateUnit(_)))
         ));
+    }
+
+    #[test]
+    fn sign_refuses_an_invalid_authorisation() {
+        let mut a = sample();
+        a.traffic.steps = vec![10, 50];
+        assert!(matches!(
+            sign(&a, &key(1)),
+            Err(SignError::Invalid(ValidationError::BadTrafficSteps))
+        ));
+    }
+
+    #[test]
+    fn an_untrusted_non_json_payload_is_untrusted_not_bad_payload() {
+        let env = sign_raw(b"not json at all", &key(2));
+        assert!(matches!(
+            verify(&env, &[key(1).verifying_key()]),
+            Err(VerifyError::NoTrustedSignature)
+        ));
+    }
+
+    #[test]
+    fn too_many_signatures_are_refused() {
+        let k = key(1);
+        let mut env = sign(&sample(), &k).unwrap();
+        let extra = env.signatures[0].clone();
+        env.signatures.resize(MAX_SIGNATURES + 1, extra);
+        assert!(matches!(
+            verify(&env, &[k.verifying_key()]),
+            Err(VerifyError::TooManySignatures)
+        ));
+        env.signatures.truncate(MAX_SIGNATURES);
+        assert!(verify(&env, &[k.verifying_key()]).is_ok());
     }
 
     #[test]

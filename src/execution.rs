@@ -37,6 +37,9 @@ pub const MAX_VALIDITY: Duration = Duration::hours(24);
 /// The longest [`ExecutionCheckpoint::detail`], in characters.
 pub const MAX_CHECKPOINT_DETAIL_CHARS: usize = 2000;
 
+/// The longest [`ExecutionCheckpoint::reason`] code, in bytes.
+pub const MAX_CHECKPOINT_REASON_BYTES: usize = 128;
+
 /// What the authorisation asks the designer to do.
 ///
 /// No `#[serde(other)]` on purpose: an operation this build does not know
@@ -131,6 +134,12 @@ pub enum ValidationError {
     UnknownSchema(String),
     /// A required identifier is empty; carries the field name.
     EmptyField(&'static str),
+    /// An identifier has leading or trailing whitespace; carries the field
+    /// name. Refused rather than trimmed, so `"a"` and `"a "` can never be
+    /// two distinct units that a receiver later reads as one.
+    BadIdentifier(&'static str),
+    /// An `update` unit has no `target.bundle_digest`; carries the unit id.
+    MissingTargetDigest(String),
     /// A digest is not `sha256:<64 lowercase hex>`; carries the field name.
     BadDigest(&'static str),
     NoUnits,
@@ -149,6 +158,10 @@ impl std::fmt::Display for ValidationError {
         match self {
             Self::UnknownSchema(s) => write!(f, "unknown schema `{s}`"),
             Self::EmptyField(n) => write!(f, "`{n}` is empty"),
+            Self::BadIdentifier(n) => write!(f, "`{n}` has leading or trailing whitespace"),
+            Self::MissingTargetDigest(u) => {
+                write!(f, "update unit `{u}` has no target bundle_digest")
+            }
             Self::BadDigest(n) => write!(f, "`{n}` is not sha256:<64 lowercase hex>"),
             Self::NoUnits => f.write_str("the authorisation covers no units"),
             Self::DuplicateUnit(u) => write!(f, "unit `{u}` appears more than once"),
@@ -188,6 +201,8 @@ fn check_digest(value: &str, field: &'static str) -> Result<(), ValidationError>
 fn check_non_empty(value: &str, field: &'static str) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
         Err(ValidationError::EmptyField(field))
+    } else if value.trim() != value {
+        Err(ValidationError::BadIdentifier(field))
     } else {
         Ok(())
     }
@@ -254,6 +269,11 @@ impl ExecutionAuthorisation {
             }
             unit.expected_baseline.validate()?;
             unit.target.validate()?;
+            // An update's target IS the release artifact; a rollback's target
+            // may legitimately be "not previously deployed" (`None`).
+            if self.operation == ExecOperation::Update && unit.target.bundle_digest.is_none() {
+                return Err(ValidationError::MissingTargetDigest(unit.unit_id.clone()));
+            }
         }
         if self.expires_at <= self.not_before {
             return Err(ValidationError::WindowInverted);
@@ -309,7 +329,8 @@ pub struct ExecutionCheckpoint {
     /// The candidate revision's share of traffic, `0..=100`.
     #[serde(default)]
     pub traffic_percent: Option<u8>,
-    /// A stable snake_case code (`baseline_changed`, `insufficient_evidence`, …).
+    /// A stable snake_case code (`baseline_changed`, `insufficient_evidence`, …),
+    /// at most [`MAX_CHECKPOINT_REASON_BYTES`].
     #[serde(default)]
     pub reason: Option<String>,
     /// A sentence for the operator, at most [`MAX_CHECKPOINT_DETAIL_CHARS`].
@@ -330,7 +351,8 @@ pub struct ExecutionCheckpoint {
 pub enum CheckpointError {
     EmptyField(&'static str),
     TrafficPercentOutOfRange,
-    /// `reason` is not a non-empty `[a-z0-9_]` code.
+    /// `reason` is not a non-empty `[a-z0-9_]` code of at most
+    /// [`MAX_CHECKPOINT_REASON_BYTES`].
     BadReason,
     DetailTooLong,
     /// `health.unit_id` names a different unit than the checkpoint.
@@ -343,7 +365,9 @@ impl std::fmt::Display for CheckpointError {
         match self {
             Self::EmptyField(n) => write!(f, "`{n}` is empty"),
             Self::TrafficPercentOutOfRange => f.write_str("traffic_percent exceeds 100"),
-            Self::BadReason => f.write_str("reason must be a non-empty snake_case code"),
+            Self::BadReason => {
+                f.write_str("reason must be a non-empty snake_case code of at most 128 bytes")
+            }
             Self::DetailTooLong => {
                 write!(f, "detail exceeds {MAX_CHECKPOINT_DETAIL_CHARS} characters")
             }
@@ -369,6 +393,7 @@ impl ExecutionCheckpoint {
         }
         if let Some(reason) = &self.reason {
             let code = !reason.is_empty()
+                && reason.len() <= MAX_CHECKPOINT_REASON_BYTES
                 && reason
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
