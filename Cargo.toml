@@ -13,6 +13,14 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "allo
 serde_json = "1"
 sha2 = "0.10"
 semver = "1"
+ed25519-dalek = { version = "2", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[features]
+# DSSE Ed25519 sign/verify for execution authorisations (`dsse::sign`,
+# `dsse::verify`, `dsse::parse_trusted_keys`). Off by default: the crate's
+# default build stays types and serde only.
+signing = ["dep:ed25519-dalek", "dep:base64"]
 
 [dev-dependencies]
 # Adds `Utc::now()` for tests only; the library itself stays clock-free.
