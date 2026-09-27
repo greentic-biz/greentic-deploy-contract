@@ -7,7 +7,7 @@
 //!
 //! One exception, behind the opt-in cargo feature `signing`: the DSSE
 //! Ed25519 sign/verify functions for execution authorisations
-//! ([`dsse::sign`], [`dsse::verify`], [`dsse::parse_trusted_keys`]). They
+//! (`dsse::sign`, `dsse::verify`, `dsse::parse_trusted_keys`). They
 //! live here so the admin (signer) and the designer (verifier) cannot
 //! disagree about the bytes a signature covers. Without the feature, the
 //! envelope type and [`dsse::pae`] are still available.

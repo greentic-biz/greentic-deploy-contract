@@ -1,16 +1,16 @@
-//! DSSE envelope for [`ExecutionAuthorisation`], signed with Ed25519.
+//! DSSE envelope for [`ExecutionAuthorisation`](crate::execution::ExecutionAuthorisation), signed with Ed25519.
 //!
 //! The envelope type and [`pae`] are always available (serde only). Signing,
 //! verification, key ids and trusted-key parsing need the cargo feature
 //! `signing`, which pulls in `ed25519-dalek` and `base64`.
 //!
-//! **The signature covers the EXACT payload bytes.** [`verify`] checks the
+//! **The signature covers the EXACT payload bytes.** `verify` checks the
 //! signature over `pae(payloadType, decoded payload)` first, and only then
 //! parses and validates. It never re-serialises: a verifier that reparsed and
 //! re-encoded before checking would be checking a different byte string than
 //! the one that was signed.
 //!
-//! **Trust comes only from the caller.** [`verify`] accepts a signature only
+//! **Trust comes only from the caller.** `verify` accepts a signature only
 //! from a key in `trusted`, whatever `keyid` the envelope claims — `keyid` is
 //! advisory, and a key named by the envelope itself establishes nothing. An
 //! empty `trusted` list accepts nothing.
