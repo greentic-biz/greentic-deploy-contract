@@ -15,7 +15,7 @@
 //!
 //! The same feature adds the typed `sign_*` / `verify_*` pairs of the other
 //! signed schemas (offline release envelope, trust rotation, revocation list,
-//! status report), all built on the generic core through [`signed`]. Their
+//! status report), all built on the generic core through the `signed` module. Their
 //! types and `validate()` need no feature.
 #![forbid(unsafe_code)]
 
@@ -37,4 +37,5 @@ pub mod release;
 pub mod revocation;
 #[cfg(feature = "signing")]
 pub mod signed;
+pub mod status;
 pub mod trust;

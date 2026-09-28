@@ -6,7 +6,7 @@
 //! [`TrustDomain`] changes is a [`TrustRotation`] signed by keys it ALREADY
 //! trusts for that same domain, with a sequence strictly greater than the
 //! last one it applied. Material bundled in a package never establishes its
-//! own authority: [`apply_rotation`] takes the current set from the caller
+//! own authority: `apply_rotation` (feature `signing`) takes the current set from the caller
 //! and never from the envelope.
 //!
 //! **Signed schemas never change.** [`TrustRotation`] is
@@ -21,8 +21,6 @@
 //! A rotation that retires its own signers must name who takes over.
 //! Independently, the resulting set is never empty: a domain with no trusted
 //! key can never be rotated again and needs the local recovery procedure.
-//!
-//! [`apply_rotation`]: crate::trust::apply_rotation
 
 use std::collections::BTreeSet;
 
@@ -105,7 +103,7 @@ impl std::error::Error for TrustError {}
 impl TrustRotation {
     /// Refuse a rotation that is malformed on its own terms. Whether each
     /// key decodes, whether the signers are trusted, the sequence and the
-    /// clock are [`apply_rotation`]'s checks.
+    /// clock are `apply_rotation`'s checks (feature `signing`).
     pub fn validate(&self) -> Result<(), TrustError> {
         if self.schema != TRUST_ROTATION_SCHEMA {
             return Err(TrustError::UnknownSchema(self.schema.clone()));
