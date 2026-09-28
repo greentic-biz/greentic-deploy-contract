@@ -194,3 +194,16 @@ fn the_verify_wrapper_agrees_with_verify_bytes() {
         serde_json::from_slice(&v.payload).unwrap();
     assert_eq!(parsed, verify(&env, &[k.verifying_key()]).unwrap());
 }
+
+#[test]
+fn a_threshold_above_max_signatures_is_unreachable() {
+    let keys: Vec<SigningKey> = (1..=8).map(key).collect();
+    let refs: Vec<&SigningKey> = keys.iter().collect();
+    let env = sign_bytes(TYPE, PAYLOAD, &refs);
+    let trusted = vks(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert!(verify_bytes(&env, TYPE, &trusted, MAX_SIGNATURES).is_ok());
+    assert!(matches!(
+        verify_bytes(&env, TYPE, &trusted, MAX_SIGNATURES + 1),
+        Err(VerifyError::ThresholdUnreachable { threshold: 9 })
+    ));
+}

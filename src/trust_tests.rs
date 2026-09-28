@@ -232,6 +232,17 @@ mod apply {
     }
 
     #[test]
+    fn an_unreachable_threshold_is_refused() {
+        let env = signed(&[3], &[], 1, &[1, 2]);
+        assert!(matches!(
+            apply_rotation_with_threshold(&set(&[1, 2]), &env, 0, ts(12), None, 9),
+            Err(RotationError::Envelope(OpenError::Signature(
+                VerifyError::ThresholdUnreachable { threshold: 9 }
+            )))
+        ));
+    }
+
+    #[test]
     fn a_replayed_or_older_sequence_is_refused() {
         let env = signed(&[2], &[], 5, &[1]);
         for last in [5, 6] {

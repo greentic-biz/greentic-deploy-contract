@@ -73,7 +73,8 @@ mod signing {
 
     /// The most signatures [`verify`] will look at. Each one costs up to
     /// `trusted.len()` Ed25519 verifications, so an envelope carrying more is
-    /// refused outright rather than verified.
+    /// refused outright rather than verified. It also bounds every threshold:
+    /// one above it is `VerifyError::ThresholdUnreachable`.
     pub const MAX_SIGNATURES: usize = 8;
 
     /// Why [`sign`] refused to sign.
@@ -125,6 +126,10 @@ mod signing {
         ZeroThreshold,
         /// The envelope carries more than [`MAX_SIGNATURES`] signatures.
         TooManySignatures,
+        /// The threshold asked for exceeds [`MAX_SIGNATURES`], so no envelope
+        /// this crate accepts could ever meet it. Refused as a configuration
+        /// error rather than reported as a missing signature.
+        ThresholdUnreachable { threshold: usize },
         /// No signature verifies under any trusted key (including: no
         /// trusted key configured, or no signatures at all).
         NoTrustedSignature,
@@ -147,6 +152,10 @@ mod signing {
                 Self::BelowThreshold { required, found } => write!(
                     f,
                     "{found} distinct trusted key(s) signed, {required} required"
+                ),
+                Self::ThresholdUnreachable { threshold } => write!(
+                    f,
+                    "a threshold of {threshold} exceeds the {MAX_SIGNATURES} signatures an envelope may carry"
                 ),
                 Self::TooManySignatures => {
                     write!(f, "envelope carries more than {MAX_SIGNATURES} signatures")
@@ -297,6 +306,9 @@ mod signing {
     ) -> Result<(Vec<u8>, Vec<VerifyingKey>), VerifyError> {
         if threshold == 0 {
             return Err(VerifyError::ZeroThreshold);
+        }
+        if threshold > MAX_SIGNATURES {
+            return Err(VerifyError::ThresholdUnreachable { threshold });
         }
         if env.payload_type != expected_type {
             return Err(VerifyError::WrongPayloadType);

@@ -24,6 +24,13 @@
 //! domain that no later rotation could verify; a domain that got there
 //! anyway needs the local recovery procedure.
 //!
+//! **Rotations are domain-scoped, not installation-scoped.** A rotation
+//! names a [`TrustDomain`] and no audience: every installation that trusts
+//! its signers for that domain may apply it. That is the intent for
+//! `vendor_release`; for `execution` and `status_report` keys, which belong
+//! to one installation, keep each installation's keys distinct so a rotation
+//! signed by them can only ever apply there.
+//!
 //! **What stays the caller's:** persisting `rotation.sequence` as the new
 //! `last_seq` (replay protection is only as good as that write), auditing
 //! the change with the signer ids, and the explicit operator acceptance a
