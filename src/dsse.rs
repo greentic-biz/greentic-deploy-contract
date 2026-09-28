@@ -105,7 +105,16 @@ mod signing {
 
     /// Why [`verify`] refused an envelope. Each is a distinct outcome so a
     /// receiver can report a distinct reason code.
+    ///
+    /// `#[non_exhaustive]` because this enum grew twice already (C1 added
+    /// `ZeroThreshold` and `BelowThreshold`) and every new signed schema may
+    /// add a refusal of its own. A consumer's exhaustive `match` turned each
+    /// of those additions into a compile break in a crate that did not care
+    /// about the new case; a consumer must now carry a wildcard arm, which
+    /// should map to a generic "signature refused" code rather than to
+    /// acceptance.
     #[derive(Debug)]
+    #[non_exhaustive]
     pub enum VerifyError {
         /// `payloadType` is not the v1 execution-authorisation type.
         WrongPayloadType,
