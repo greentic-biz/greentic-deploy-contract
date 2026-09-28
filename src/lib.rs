@@ -12,6 +12,11 @@
 //! live here so the admin (signer) and the designer (verifier) cannot
 //! disagree about the bytes a signature covers. Without the feature, the
 //! envelope type and [`dsse::pae`] are still available.
+//!
+//! The same feature adds the typed `sign_*` / `verify_*` pairs of the other
+//! signed schemas (offline release envelope, trust rotation, revocation list,
+//! status report), all built on the generic core through [`signed`]. Their
+//! types and `validate()` need no feature.
 #![forbid(unsafe_code)]
 
 mod enums;
@@ -27,4 +32,7 @@ pub mod execution;
 pub mod governance;
 pub mod health;
 pub mod inventory;
+pub mod offline;
 pub mod release;
+#[cfg(feature = "signing")]
+pub mod signed;
