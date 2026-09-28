@@ -12,6 +12,13 @@
 //! Importing it never deploys: the local admin resolves its own inventory and
 //! signs its own execution authorisations.
 //!
+//! **What stays the importer's:** [`OfflineReleaseManifest::admit`] (the
+//! audience names THIS installation, `now < not_after`); hashing every file
+//! against the inventory; checking that `internal_registry` / `installed`
+//! sources are actually present; verifying bundled trust material (R12
+//! layout) against keys it already trusts; and persisting the accepted
+//! revocation list it verified with.
+//!
 //! **Signed schemas never change.** Every type defined here is
 //! `deny_unknown_fields`, and no enum has a `#[serde(other)]` catch-all: a
 //! field or value this build does not know is one it cannot enforce, so the
@@ -22,19 +29,29 @@
 //!
 //! [`validate`]: OfflineReleaseManifest::validate
 
-use std::collections::BTreeSet;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::execution::{is_clean_identifier, is_sha256_digest};
-use crate::release::{DependencyKind, DependencyPin, RegisterReleaseRequest, release_digest};
+use crate::release::{DependencyKind, DependencyPin, RegisterReleaseRequest};
+
+pub use validate::is_safe_relative_path;
 
 /// The `schema` value every v1 offline manifest carries.
 pub const OFFLINE_RELEASE_SCHEMA: &str = "greentic.offline-release.v1";
 
 /// The DSSE `payloadType` a v1 offline manifest is signed under.
 pub const OFFLINE_RELEASE_PAYLOAD_TYPE: &str = "application/vnd.greentic.offline-release.v1+json";
+
+/// The largest `max_unpacked_bytes` a manifest may declare: 2^50 bytes
+/// (1 PiB). Far above any real package, and low enough that an importer's
+/// "× 1.1 plus a floor" disk-space arithmetic cannot overflow a `u64`.
+pub const MAX_UNPACKED_BYTES: u64 = 1 << 50;
+
+/// The longest inventory path, in bytes.
+pub const MAX_PATH_BYTES: usize = 4096;
+
+/// The longest single path segment, in bytes.
+pub const MAX_PATH_SEGMENT_BYTES: usize = 255;
 
 /// Which installations may import the package. Never empty: a package for
 /// "anyone" is exactly what a stolen download would be.
@@ -52,7 +69,7 @@ pub struct Audience {
 pub struct ReleaseEntry {
     pub release_id: String,
     /// `sha256:<64 lowercase hex>`; must equal
-    /// [`release_digest`]`(&request)`.
+    /// [`release_digest`](crate::release::release_digest)`(&request)`.
     pub release_digest: String,
     pub request: RegisterReleaseRequest,
 }
@@ -74,7 +91,7 @@ pub enum ArtifactRole {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackagedArtifact {
-    /// Relative, `/`-separated, no `..`, `.` or empty segment, no backslash.
+    /// See [`is_safe_relative_path`]; unique case-insensitively.
     pub path: String,
     /// `sha256:<64 lowercase hex>` of the file's bytes.
     pub digest: String,
@@ -91,7 +108,9 @@ pub struct PackagedArtifact {
 pub enum ClosureSource {
     /// Inside this package; `digest` must be in the inventory.
     Packaged { digest: String },
-    /// Present in a registry reachable from the installation.
+    /// Present in a registry reachable from the installation. Always
+    /// digest-pinned (`…@sha256:<64 lowercase hex>`): a mutable tag in the
+    /// internal registry would satisfy a pin with whatever it points at.
     InternalRegistry { oci_ref: String },
     /// Already installed; only valid in an [`PackageMode::InventoryBased`]
     /// package, which binds to the inventory it was computed against.
@@ -99,7 +118,11 @@ pub enum ClosureSource {
 }
 
 /// One resolved dependency. `kind`, `name`, `version_req` and `digest` must
-/// equal a release's [`DependencyPin`] exactly for that pin to be resolved.
+/// equal a release's [`DependencyPin`] exactly for that pin to be resolved,
+/// and no two entries may share those four (so a pin resolves to exactly one
+/// source). When `digest` is set, the source is bound to it: a `packaged`
+/// digest must equal it, and an `internal_registry` reference must be pinned
+/// to it (`…@sha256:<hex>`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClosureEntry {
@@ -113,7 +136,7 @@ pub struct ClosureEntry {
 }
 
 impl ClosureEntry {
-    fn resolves(&self, pin: &DependencyPin) -> bool {
+    pub(crate) fn resolves(&self, pin: &DependencyPin) -> bool {
         self.kind == pin.kind
             && self.name == pin.name
             && self.version_req == pin.version_req
@@ -142,6 +165,10 @@ pub enum PackageMode {
 }
 
 /// The signed metadata of an offline release package. See the module doc.
+///
+/// In `complete` mode every artifact of every release request is in
+/// `inventory` by digest; an `inventory_based` package may instead rely on
+/// the installation inventory it is bound to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfflineReleaseManifest {
@@ -169,7 +196,8 @@ pub struct OfflineReleaseManifest {
     #[serde(default)]
     pub trust_statements: Vec<String>,
     /// Upper bound on everything the package unpacks to; at least the sum of
-    /// `inventory[].bytes`. Admission checks disk space against it.
+    /// `inventory[].bytes`, at most [`MAX_UNPACKED_BYTES`]. Admission checks
+    /// disk space against it.
     pub max_unpacked_bytes: u64,
 }
 
@@ -184,13 +212,25 @@ pub enum OfflineError {
     EmptyAudience,
     DuplicateInstallation(String),
     NoReleases,
+    /// Two releases share a `release_id` or a `release_digest`.
     DuplicateRelease(String),
     /// A digest is not `sha256:<64 lowercase hex>`; carries the field name.
     BadDigest(&'static str),
     /// `release_digest` does not equal the digest of `request`.
     ReleaseDigestMismatch(String),
-    /// Absolute, backslashed, or with a `..` / `.` / empty segment.
+    /// A `complete` package lacks an artifact of one of its releases.
+    ArtifactMissing {
+        release_id: String,
+        digest: String,
+    },
+    /// An artifact's `target` is not among the declared `architectures`.
+    UnsupportedTarget {
+        release_id: String,
+        target: String,
+    },
+    /// See [`is_safe_relative_path`].
     UnsafePath(String),
+    /// Two paths that are equal, or equal ignoring ASCII case.
     DuplicatePath(String),
     /// A release's dependency pin has no matching closure entry; carries the
     /// release id and the dependency name.
@@ -198,15 +238,25 @@ pub enum OfflineError {
         release_id: String,
         name: String,
     },
+    /// Two closure entries for one `(kind, name, version_req, digest)`.
+    DuplicateClosureEntry(String),
     /// A `packaged` closure source names a digest absent from the inventory.
     PackagedDigestMissing(String),
+    /// A closure source disagrees with the entry's pinned `digest`.
+    SourceDigestMismatch(String),
+    /// An `internal_registry` reference is not `…@sha256:<64 lowercase hex>`.
+    UnpinnedOciRef(String),
     /// An `installed` source in a `complete` package.
     InstalledInCompletePackage(String),
     EmptyOciRef,
+    /// A trust-statement digest listed twice, or equal to `revocation`.
+    DuplicateTrustMaterial(String),
     /// `not_after` is not after `created_at`.
     WindowInverted,
     /// `max_unpacked_bytes` is below the inventory total (or it overflows).
     UnpackedSizeTooSmall,
+    /// `max_unpacked_bytes` exceeds [`MAX_UNPACKED_BYTES`].
+    UnpackedSizeTooLarge,
 }
 
 impl std::fmt::Display for OfflineError {
@@ -222,22 +272,42 @@ impl std::fmt::Display for OfflineError {
             Self::ReleaseDigestMismatch(id) => {
                 write!(f, "release `{id}` digest does not match its request")
             }
+            Self::ArtifactMissing { release_id, digest } => write!(
+                f,
+                "release `{release_id}` artifact `{digest}` is not in the package"
+            ),
+            Self::UnsupportedTarget { release_id, target } => write!(
+                f,
+                "release `{release_id}` targets `{target}`, which the package does not declare"
+            ),
             Self::UnsafePath(p) => write!(f, "path `{p}` is not a safe relative path"),
             Self::DuplicatePath(p) => write!(f, "path `{p}` is listed twice"),
             Self::UnresolvedDependency { release_id, name } => write!(
                 f,
                 "release `{release_id}` dependency `{name}` is not resolved by the closure"
             ),
+            Self::DuplicateClosureEntry(n) => write!(f, "closure entry `{n}` is listed twice"),
             Self::PackagedDigestMissing(d) => {
                 write!(f, "packaged dependency `{d}` is not in the inventory")
             }
+            Self::SourceDigestMismatch(n) => {
+                write!(
+                    f,
+                    "closure entry `{n}` source does not match its pinned digest"
+                )
+            }
+            Self::UnpinnedOciRef(r) => write!(f, "`{r}` is not pinned by sha256 digest"),
             Self::InstalledInCompletePackage(n) => {
                 write!(f, "`{n}` is marked installed in a complete package")
             }
             Self::EmptyOciRef => f.write_str("an oci_ref is empty"),
+            Self::DuplicateTrustMaterial(d) => write!(f, "trust material `{d}` is listed twice"),
             Self::WindowInverted => f.write_str("not_after is not after created_at"),
             Self::UnpackedSizeTooSmall => {
                 f.write_str("max_unpacked_bytes is below the inventory's total size")
+            }
+            Self::UnpackedSizeTooLarge => {
+                write!(f, "max_unpacked_bytes exceeds {MAX_UNPACKED_BYTES}")
             }
         }
     }
@@ -245,179 +315,42 @@ impl std::fmt::Display for OfflineError {
 
 impl std::error::Error for OfflineError {}
 
-fn digest(value: &str, field: &'static str) -> Result<(), OfflineError> {
-    if is_sha256_digest(value) {
-        Ok(())
-    } else {
-        Err(OfflineError::BadDigest(field))
+/// Why [`OfflineReleaseManifest::admit`] refused a verified manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OfflineAdmitError {
+    /// The audience does not name this installation.
+    NotForThisInstallation,
+    /// `now >= not_after`.
+    Expired,
+}
+
+impl std::fmt::Display for OfflineAdmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotForThisInstallation => f.write_str("package is for another installation"),
+            Self::Expired => f.write_str("package has expired"),
+        }
     }
 }
 
-fn ident(value: &str, field: &'static str) -> Result<(), OfflineError> {
-    if is_clean_identifier(value) {
-        Ok(())
-    } else {
-        Err(OfflineError::BadIdentifier(field))
-    }
-}
+impl std::error::Error for OfflineAdmitError {}
 
-/// A relative, `/`-separated path with no traversal. Refused rather than
-/// normalised: two spellings of one path would be two inventory entries.
-pub fn is_safe_relative_path(path: &str) -> bool {
-    !path.is_empty()
-        && !path.starts_with('/')
-        && !path.contains('\\')
-        && !path.contains('\0')
-        && path
-            .split('/')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
-}
-
-impl OfflineReleaseManifest {
-    /// Refuse a manifest that is malformed on its own terms. Time admission
-    /// (`now < not_after`), the audience matching THIS installation, the
-    /// file digests and the availability of `internal_registry` / `installed`
-    /// sources are the importer's checks.
-    pub fn validate(&self) -> Result<(), OfflineError> {
-        if self.schema != OFFLINE_RELEASE_SCHEMA {
-            return Err(OfflineError::UnknownSchema(self.schema.clone()));
-        }
-        ident(&self.envelope_id, "envelope_id")?;
-        if self.not_after <= self.created_at {
-            return Err(OfflineError::WindowInverted);
-        }
-        self.validate_audience()?;
-        let inventory = self.validate_inventory()?;
-        self.validate_releases()?;
-        self.validate_closure(&inventory)?;
-        for arch in &self.architectures {
-            ident(arch, "architectures")?;
-        }
-        if let PackageMode::InventoryBased { inventory_digest } = &self.mode {
-            digest(inventory_digest, "mode.inventory_digest")?;
-        }
-        if let Some(rev) = &self.revocation {
-            digest(rev, "revocation")?;
-        }
-        for statement in &self.trust_statements {
-            digest(statement, "trust_statements")?;
-        }
-        Ok(())
-    }
-
-    fn validate_audience(&self) -> Result<(), OfflineError> {
-        if self.audience.installation_ids.is_empty() {
-            return Err(OfflineError::EmptyAudience);
-        }
-        let mut seen = BTreeSet::new();
-        for id in &self.audience.installation_ids {
-            ident(id, "audience.installation_ids")?;
-            if !seen.insert(id.as_str()) {
-                return Err(OfflineError::DuplicateInstallation(id.clone()));
-            }
-        }
-        if let Some(owner) = &self.audience.owner_ref {
-            ident(owner, "audience.owner_ref")?;
-        }
-        Ok(())
-    }
-
-    /// Returns the set of inventory digests.
-    fn validate_inventory(&self) -> Result<BTreeSet<&str>, OfflineError> {
-        let mut paths = BTreeSet::new();
-        let mut digests = BTreeSet::new();
-        let mut total: u64 = 0;
-        for item in &self.inventory {
-            if !is_safe_relative_path(&item.path) {
-                return Err(OfflineError::UnsafePath(item.path.clone()));
-            }
-            if !paths.insert(item.path.as_str()) {
-                return Err(OfflineError::DuplicatePath(item.path.clone()));
-            }
-            digest(&item.digest, "inventory.digest")?;
-            if item.oci_ref.as_deref().is_some_and(|r| r.trim().is_empty()) {
-                return Err(OfflineError::EmptyOciRef);
-            }
-            digests.insert(item.digest.as_str());
-            total = total
-                .checked_add(item.bytes)
-                .ok_or(OfflineError::UnpackedSizeTooSmall)?;
-        }
-        if self.max_unpacked_bytes < total {
-            return Err(OfflineError::UnpackedSizeTooSmall);
-        }
-        Ok(digests)
-    }
-
-    fn validate_releases(&self) -> Result<(), OfflineError> {
-        if self.releases.is_empty() {
-            return Err(OfflineError::NoReleases);
-        }
-        let mut seen = BTreeSet::new();
-        for entry in &self.releases {
-            ident(&entry.release_id, "releases.release_id")?;
-            digest(&entry.release_digest, "releases.release_digest")?;
-            if !seen.insert(entry.release_digest.as_str()) {
-                return Err(OfflineError::DuplicateRelease(entry.release_digest.clone()));
-            }
-            let computed = release_digest(&entry.request)
-                .map_err(|_| OfflineError::ReleaseDigestMismatch(entry.release_id.clone()))?;
-            if computed != entry.release_digest {
-                return Err(OfflineError::ReleaseDigestMismatch(
-                    entry.release_id.clone(),
-                ));
-            }
-            for pin in &entry.request.dependencies {
-                if !self.closure.entries.iter().any(|c| c.resolves(pin)) {
-                    return Err(OfflineError::UnresolvedDependency {
-                        release_id: entry.release_id.clone(),
-                        name: pin.name.clone(),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_closure(&self, inventory: &BTreeSet<&str>) -> Result<(), OfflineError> {
-        let complete = matches!(self.mode, PackageMode::Complete);
-        for entry in &self.closure.entries {
-            ident(&entry.name, "closure.name")?;
-            if let Some(d) = &entry.digest {
-                digest(d, "closure.digest")?;
-            }
-            match &entry.source {
-                ClosureSource::Packaged { digest: d } => {
-                    digest(d, "closure.source.digest")?;
-                    if !inventory.contains(d.as_str()) {
-                        return Err(OfflineError::PackagedDigestMissing(d.clone()));
-                    }
-                }
-                ClosureSource::InternalRegistry { oci_ref } => {
-                    if oci_ref.trim().is_empty() {
-                        return Err(OfflineError::EmptyOciRef);
-                    }
-                }
-                ClosureSource::Installed if complete => {
-                    return Err(OfflineError::InstalledInCompletePackage(entry.name.clone()));
-                }
-                ClosureSource::Installed => {}
-            }
-        }
-        Ok(())
-    }
-}
+#[path = "offline_validate.rs"]
+mod validate;
 
 #[cfg(feature = "signing")]
 pub use signing::*;
 
 #[cfg(feature = "signing")]
 mod signing {
-    use ed25519_dalek::{SigningKey, VerifyingKey};
+    use ed25519_dalek::SigningKey;
 
     use super::{OFFLINE_RELEASE_PAYLOAD_TYPE, OfflineError, OfflineReleaseManifest};
     use crate::dsse::DsseEnvelope;
-    use crate::signed::{OpenError, SignError, open_typed, sign_typed};
+    use crate::revocation::RevocationList;
+    use crate::signed::{OpenError, OpenSpec, Opened, SignError, open_typed, sign_typed};
+    use crate::trust::{TrustDomain, TrustSet};
 
     /// Validate, then sign `manifest` with every key in `keys` (a k-of-n
     /// vendor quorum signs once each).
@@ -434,22 +367,37 @@ mod signing {
     }
 
     /// Verify that `threshold` distinct keys from `trusted` (the
-    /// installation's VENDOR-RELEASE trust set) signed `env`, then parse and
-    /// validate. The audience, the clock and the file digests are the
-    /// importer's checks.
+    /// VENDOR-RELEASE set; any other domain is refused), none revoked by
+    /// `revocation`, signed `env`; parse and validate; and refuse a manifest
+    /// carrying a release `revocation` revokes. Then call
+    /// [`OfflineReleaseManifest::admit`].
     pub fn verify_offline(
         env: &DsseEnvelope,
-        trusted: &[VerifyingKey],
+        trusted: &TrustSet,
         threshold: usize,
-    ) -> Result<OfflineReleaseManifest, OpenError<OfflineError>> {
-        open_typed(
+        revocation: Option<&RevocationList>,
+    ) -> Result<Opened<OfflineReleaseManifest>, OpenError<OfflineError>> {
+        let opened = open_typed(
             env,
-            OFFLINE_RELEASE_PAYLOAD_TYPE,
-            trusted,
-            threshold,
+            OpenSpec {
+                payload_type: OFFLINE_RELEASE_PAYLOAD_TYPE,
+                domain: TrustDomain::VendorRelease,
+                trusted,
+                threshold,
+                revocation,
+            },
             OfflineReleaseManifest::validate,
-        )
-        .map(|(manifest, _)| manifest)
+        )?;
+        if let Some(list) = revocation
+            && let Some(entry) = opened
+                .value
+                .releases
+                .iter()
+                .find(|r| list.is_revoked_release(&r.release_digest))
+        {
+            return Err(OpenError::RevokedRelease(entry.release_digest.clone()));
+        }
+        Ok(opened)
     }
 }
 

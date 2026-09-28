@@ -37,7 +37,11 @@ fn shape_refusals() {
     assert_eq!(l.validate(), Err(RevocationError::BadIssuer));
     let mut l = sample();
     l.sequence = 0;
-    assert_eq!(l.validate(), Err(RevocationError::ZeroSequence));
+    assert_eq!(l.validate(), Err(RevocationError::BadSequence));
+    l.sequence = crate::MAX_SEQUENCE + 1;
+    assert_eq!(l.validate(), Err(RevocationError::BadSequence));
+    l.sequence = crate::MAX_SEQUENCE;
+    assert_eq!(l.validate(), Ok(()));
     let mut l = sample();
     l.valid_until = l.issued_at;
     assert_eq!(l.validate(), Err(RevocationError::WindowInverted));
@@ -73,26 +77,80 @@ fn an_empty_list_is_valid() {
 fn freshness() {
     let l = sample();
     let day = Duration::hours(24);
-    assert_eq!(l.freshness(ts(12), day), Freshness::Fresh);
+    let none = Duration::zero();
+    assert_eq!(l.freshness(ts(12), day, none), Freshness::Fresh);
     assert_eq!(
-        l.freshness(ts(20), day),
+        l.freshness(ts(20), day, none),
         Freshness::Stale {
             reason: StaleReason::Expired
         }
     );
     assert_eq!(
-        l.freshness(ts(9), day),
+        l.freshness(ts(9), day, none),
         Freshness::Stale {
             reason: StaleReason::IssuedInFuture
         }
     );
     assert_eq!(
-        l.freshness(ts(13), Duration::hours(2)),
+        l.freshness(ts(13), Duration::hours(2), none),
         Freshness::Stale {
             reason: StaleReason::TooOld
         }
     );
-    assert_eq!(l.freshness(ts(12), Duration::hours(2)), Freshness::Fresh);
+    assert_eq!(
+        l.freshness(ts(12), Duration::hours(2), none),
+        Freshness::Fresh
+    );
+}
+
+#[test]
+fn skew_tolerates_a_slightly_early_issuer_clock() {
+    let l = sample();
+    let early = ts(10) - Duration::minutes(2);
+    assert_eq!(
+        l.freshness(early, Duration::hours(24), Duration::minutes(5)),
+        Freshness::Fresh
+    );
+    assert_eq!(
+        l.freshness(early, Duration::hours(24), Duration::minutes(1)),
+        Freshness::Stale {
+            reason: StaleReason::IssuedInFuture
+        }
+    );
+    // Negative parameters read as zero.
+    assert_eq!(
+        l.freshness(ts(12), Duration::hours(-1), Duration::zero()),
+        Freshness::Stale {
+            reason: StaleReason::TooOld
+        }
+    );
+}
+
+#[test]
+fn a_list_must_follow_the_previous_one() {
+    let prev = sample();
+    let mut next = sample();
+    next.sequence = 5;
+    assert_eq!(next.follows(&prev), Ok(()));
+    next.sequence = 4;
+    assert!(matches!(
+        next.follows(&prev),
+        Err(RevocationError::NotNewer { .. })
+    ));
+    let mut next = sample();
+    next.sequence = 5;
+    next.revoked_key_ids.clear();
+    assert_eq!(
+        next.follows(&prev),
+        Err(RevocationError::DropsRevocation("0123456789abcdef".into()))
+    );
+    let mut next = sample();
+    next.sequence = 5;
+    next.revoked_release_digests.clear();
+    assert!(matches!(
+        next.follows(&prev),
+        Err(RevocationError::DropsRevocation(_))
+    ));
 }
 
 #[test]
@@ -116,10 +174,18 @@ mod signing_tests {
     use super::*;
     use crate::dsse::{VerifyError, key_id};
     use crate::signed::OpenError;
+    use crate::trust::{TrustDomain, TrustSet};
     use ed25519_dalek::SigningKey;
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn vendor(seeds: &[u8]) -> TrustSet {
+        TrustSet::new(
+            TrustDomain::VendorRelease,
+            seeds.iter().map(|s| key(*s).verifying_key()).collect(),
+        )
     }
 
     #[test]
@@ -129,22 +195,79 @@ mod signing_tests {
         let mut l = sample();
         l.revoked_key_ids = vec![key_id(&revoked)];
         let env = sign_revocation(&l, &[&signer]).unwrap();
-        let back = verify_revocation(&env, &[signer.verifying_key()], 1).unwrap();
-        assert_eq!(back, l);
-        assert!(back.is_revoked_key(&revoked));
-        assert!(!back.is_revoked_key(&signer.verifying_key()));
+        let back = verify_revocation(&env, &vendor(&[1]), 1, None).unwrap();
+        assert_eq!(back.value, l);
+        assert_eq!(back.signer_key_ids, vec![key_id(&signer.verifying_key())]);
+        assert!(back.value.is_revoked_key(&revoked));
+        assert!(!back.value.is_revoked_key(&signer.verifying_key()));
         assert_eq!(
-            back.retain_unrevoked(&[signer.verifying_key(), revoked]),
+            back.value
+                .retain_unrevoked(&[signer.verifying_key(), revoked]),
             vec![signer.verifying_key()]
         );
     }
 
     #[test]
-    fn an_untrusted_issuer_is_refused() {
+    fn an_untrusted_issuer_or_wrong_domain_is_refused() {
         let env = sign_revocation(&sample(), &[&key(1)]).unwrap();
         assert!(matches!(
-            verify_revocation(&env, &[key(3).verifying_key()], 1),
+            verify_revocation(&env, &vendor(&[3]), 1, None),
             Err(OpenError::Signature(VerifyError::NoTrustedSignature))
         ));
+        let status = TrustSet::new(TrustDomain::StatusReport, vec![key(1).verifying_key()]);
+        assert!(matches!(
+            verify_revocation(&env, &status, 1, None),
+            Err(OpenError::WrongTrustDomain { .. })
+        ));
+    }
+
+    #[test]
+    fn a_revoked_key_cannot_sign_the_next_list_and_un_revoke_itself() {
+        let leaked = key(2);
+        let mut prev = sample();
+        prev.revoked_key_ids = vec![key_id(&leaked.verifying_key())];
+        let mut next = sample();
+        next.sequence = 5;
+        next.revoked_key_ids.clear();
+        let env = sign_revocation(&next, &[&leaked]).unwrap();
+        assert!(matches!(
+            verify_revocation(&env, &vendor(&[1, 2]), 1, Some(&prev)),
+            Err(OpenError::RevokedSigner(_))
+        ));
+    }
+
+    #[test]
+    fn a_list_signed_by_a_key_it_revokes_is_refused() {
+        let k = key(1);
+        let mut l = sample();
+        l.revoked_key_ids = vec![key_id(&k.verifying_key())];
+        let env = sign_revocation(&l, &[&k]).unwrap();
+        assert!(matches!(
+            verify_revocation(&env, &vendor(&[1]), 1, None),
+            Err(OpenError::RevokedSigner(_))
+        ));
+    }
+
+    #[test]
+    fn the_next_list_must_be_newer_and_a_superset() {
+        let prev = sample();
+        let env = sign_revocation(&sample(), &[&key(1)]).unwrap();
+        assert!(matches!(
+            verify_revocation(&env, &vendor(&[1]), 1, Some(&prev)),
+            Err(OpenError::Invalid(RevocationError::NotNewer { .. }))
+        ));
+        let mut next = sample();
+        next.sequence = 5;
+        next.revoked_release_digests.clear();
+        let env = sign_revocation(&next, &[&key(1)]).unwrap();
+        assert!(matches!(
+            verify_revocation(&env, &vendor(&[1]), 1, Some(&prev)),
+            Err(OpenError::Invalid(RevocationError::DropsRevocation(_)))
+        ));
+        let mut next = sample();
+        next.sequence = 5;
+        next.revoked_release_digests.push(digest('b'));
+        let env = sign_revocation(&next, &[&key(1)]).unwrap();
+        assert!(verify_revocation(&env, &vendor(&[1]), 1, Some(&prev)).is_ok());
     }
 }

@@ -279,6 +279,22 @@ mod signing {
         trusted: &[VerifyingKey],
         threshold: usize,
     ) -> Result<Verified, VerifyError> {
+        verify_signer_keys(env, expected_type, trusted, threshold).map(|(payload, signers)| {
+            Verified {
+                payload,
+                signer_key_ids: signers.iter().map(key_id).collect(),
+            }
+        })
+    }
+
+    /// [`verify_bytes`], returning the signing KEYS themselves rather than
+    /// their truncated ids, for callers that compare signers against a set.
+    pub(crate) fn verify_signer_keys(
+        env: &DsseEnvelope,
+        expected_type: &str,
+        trusted: &[VerifyingKey],
+        threshold: usize,
+    ) -> Result<(Vec<u8>, Vec<VerifyingKey>), VerifyError> {
         if threshold == 0 {
             return Err(VerifyError::ZeroThreshold);
         }
@@ -318,10 +334,7 @@ mod signing {
                 required: threshold,
                 found,
             }),
-            _ => Ok(Verified {
-                payload,
-                signer_key_ids: signers.into_iter().map(key_id).collect(),
-            }),
+            _ => Ok((payload, signers.into_iter().copied().collect())),
         }
     }
 

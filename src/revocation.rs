@@ -14,6 +14,12 @@
 //! the caller's decision. An offline system cannot learn of a revocation
 //! issued after its latest transfer, and nothing here pretends otherwise.
 //!
+//! **Lists chain.** `verify_revocation` takes the previously accepted list:
+//! a key it revoked cannot sign the next one, the next one must have a
+//! greater sequence and must keep every revocation (a list can never
+//! un-revoke), and a list signed by a key it revokes itself is refused.
+//! Persisting the accepted list is the caller's.
+//!
 //! **Signed schemas never change**: `deny_unknown_fields`, a new field is a
 //! new schema.
 
@@ -57,8 +63,9 @@ pub enum StaleReason {
     Expired,
     /// `now - issued_at > max_age`.
     TooOld,
-    /// `issued_at` is after `now`: the importer's clock or the issuer's is
-    /// wrong, and a list from the future proves nothing about the present.
+    /// `issued_at` is more than `skew` after `now`: the importer's clock or
+    /// the issuer's is wrong, and a list from the future proves nothing
+    /// about the present.
     IssuedInFuture,
 }
 
@@ -75,13 +82,22 @@ pub enum Freshness {
 pub enum RevocationError {
     UnknownSchema(String),
     BadIssuer,
-    ZeroSequence,
+    /// `0`, or above [`crate::MAX_SEQUENCE`].
+    BadSequence,
     /// `valid_until` is not after `issued_at`.
     WindowInverted,
     /// Not 16 lowercase hex digits.
     BadKeyId(String),
     BadDigest(String),
     Duplicate(String),
+    /// The sequence is not greater than the previously accepted list's.
+    NotNewer {
+        sequence: u64,
+        previous: u64,
+    },
+    /// The list drops an entry the previously accepted list revoked;
+    /// revocation is monotonic and never undone.
+    DropsRevocation(String),
 }
 
 impl std::fmt::Display for RevocationError {
@@ -89,11 +105,18 @@ impl std::fmt::Display for RevocationError {
         match self {
             Self::UnknownSchema(s) => write!(f, "unknown schema `{s}`"),
             Self::BadIssuer => f.write_str("issuer is empty or has surrounding whitespace"),
-            Self::ZeroSequence => f.write_str("sequence must be at least 1"),
+            Self::BadSequence => f.write_str("sequence must be in 1..=MAX_SEQUENCE"),
             Self::WindowInverted => f.write_str("valid_until is not after issued_at"),
             Self::BadKeyId(k) => write!(f, "`{k}` is not a 16-hex-digit key id"),
             Self::BadDigest(d) => write!(f, "`{d}` is not sha256:<64 lowercase hex>"),
             Self::Duplicate(v) => write!(f, "`{v}` is listed twice"),
+            Self::NotNewer { sequence, previous } => write!(
+                f,
+                "sequence {sequence} is not greater than the accepted list's {previous}"
+            ),
+            Self::DropsRevocation(v) => {
+                write!(f, "`{v}` was revoked by the accepted list and is missing")
+            }
         }
     }
 }
@@ -116,8 +139,8 @@ impl RevocationList {
         if !is_clean_identifier(&self.issuer) {
             return Err(RevocationError::BadIssuer);
         }
-        if self.sequence == 0 {
-            return Err(RevocationError::ZeroSequence);
+        if self.sequence == 0 || self.sequence > crate::MAX_SEQUENCE {
+            return Err(RevocationError::BadSequence);
         }
         if self.valid_until <= self.issued_at {
             return Err(RevocationError::WindowInverted);
@@ -143,11 +166,15 @@ impl RevocationList {
     }
 
     /// Whether the list may still be relied on at `now` under the local
-    /// `max_age` policy. Expiry is checked first, then the future, then age.
-    pub fn freshness(&self, now: DateTime<Utc>, max_age: Duration) -> Freshness {
+    /// `max_age` policy, tolerating `skew` of issuer clock ahead of ours.
+    /// Expiry is checked first, then the future, then age. A negative
+    /// `max_age` or `skew` is read as zero.
+    pub fn freshness(&self, now: DateTime<Utc>, max_age: Duration, skew: Duration) -> Freshness {
+        let max_age = max_age.max(Duration::zero());
+        let skew = skew.max(Duration::zero());
         let reason = if now >= self.valid_until {
             Some(StaleReason::Expired)
-        } else if self.issued_at > now {
+        } else if self.issued_at - now > skew {
             Some(StaleReason::IssuedInFuture)
         } else if now - self.issued_at > max_age {
             Some(StaleReason::TooOld)
@@ -157,6 +184,32 @@ impl RevocationList {
         match reason {
             Some(reason) => Freshness::Stale { reason },
             None => Freshness::Fresh,
+        }
+    }
+
+    /// Refuse a list that does not follow `previous`, the last one this
+    /// installation accepted: the sequence must grow and nothing `previous`
+    /// revoked may be dropped.
+    pub fn follows(&self, previous: &RevocationList) -> Result<(), RevocationError> {
+        if self.sequence <= previous.sequence {
+            return Err(RevocationError::NotNewer {
+                sequence: self.sequence,
+                previous: previous.sequence,
+            });
+        }
+        let dropped = previous
+            .revoked_key_ids
+            .iter()
+            .find(|k| !self.revoked_key_ids.contains(k))
+            .or_else(|| {
+                previous
+                    .revoked_release_digests
+                    .iter()
+                    .find(|d| !self.revoked_release_digests.contains(d))
+            });
+        match dropped {
+            Some(v) => Err(RevocationError::DropsRevocation(v.clone())),
+            None => Ok(()),
         }
     }
 
@@ -184,7 +237,8 @@ mod signing {
 
     use super::{REVOCATION_PAYLOAD_TYPE, RevocationError, RevocationList};
     use crate::dsse::{DsseEnvelope, key_id};
-    use crate::signed::{OpenError, SignError, open_typed, sign_typed};
+    use crate::signed::{OpenError, OpenSpec, Opened, SignError, open_typed, sign_typed};
+    use crate::trust::{TrustDomain, TrustSet};
 
     impl RevocationList {
         /// Whether `key` is revoked (by its [`key_id`]).
@@ -215,20 +269,39 @@ mod signing {
     }
 
     /// Verify `env` against the VENDOR-RELEASE trust set (`threshold`
-    /// distinct signers), then parse and validate.
+    /// distinct signers not revoked by `previous`), parse, validate, refuse a
+    /// list signed by a key it revokes itself, and — when `previous` is the
+    /// last accepted list — require [`RevocationList::follows`] it.
     pub fn verify_revocation(
         env: &DsseEnvelope,
-        trusted: &[VerifyingKey],
+        trusted: &TrustSet,
         threshold: usize,
-    ) -> Result<RevocationList, OpenError<RevocationError>> {
-        open_typed(
+        previous: Option<&RevocationList>,
+    ) -> Result<Opened<RevocationList>, OpenError<RevocationError>> {
+        let opened = open_typed(
             env,
-            REVOCATION_PAYLOAD_TYPE,
-            trusted,
-            threshold,
+            OpenSpec {
+                payload_type: REVOCATION_PAYLOAD_TYPE,
+                domain: TrustDomain::VendorRelease,
+                trusted,
+                threshold,
+                revocation: previous,
+            },
             RevocationList::validate,
-        )
-        .map(|(list, _)| list)
+        )?;
+        let self_revoked: Vec<String> = opened
+            .signer_key_ids
+            .iter()
+            .filter(|id| opened.value.is_revoked_key_id(id))
+            .cloned()
+            .collect();
+        if !self_revoked.is_empty() {
+            return Err(OpenError::RevokedSigner(self_revoked));
+        }
+        if let Some(prev) = previous {
+            opened.value.follows(prev).map_err(OpenError::Invalid)?;
+        }
+        Ok(opened)
     }
 }
 

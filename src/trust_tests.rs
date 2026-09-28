@@ -34,7 +34,9 @@ fn shape_refusals() {
     assert!(matches!(r.validate(), Err(TrustError::UnknownSchema(_))));
     let mut r = rotation(&[K1], &[]);
     r.sequence = 0;
-    assert_eq!(r.validate(), Err(TrustError::ZeroSequence));
+    assert_eq!(r.validate(), Err(TrustError::BadSequence));
+    r.sequence = u64::MAX;
+    assert_eq!(r.validate(), Err(TrustError::BadSequence));
     assert_eq!(rotation(&[], &[]).validate(), Err(TrustError::NoChange));
     let mut r = rotation(&[K1], &[]);
     r.expires_at = r.effective_at;
@@ -89,7 +91,8 @@ fn unknown_fields_and_domains_are_refused() {
 #[cfg(feature = "signing")]
 mod apply {
     use super::*;
-    use crate::dsse::{VerifyError, format_trusted_key};
+    use crate::dsse::{DsseEnvelope, VerifyError, format_trusted_key, key_id};
+    use crate::revocation::{REVOCATION_SCHEMA, RevocationList};
     use crate::signed::OpenError;
     use ed25519_dalek::{SigningKey, VerifyingKey};
 
@@ -105,7 +108,14 @@ mod apply {
         format_trusted_key(&vk(seed))
     }
 
-    fn signed(add: &[u8], remove: &[u8], seq: u64, signers: &[u8]) -> crate::dsse::DsseEnvelope {
+    fn set(seeds: &[u8]) -> TrustSet {
+        TrustSet::new(
+            TrustDomain::Execution,
+            seeds.iter().map(|s| vk(*s)).collect(),
+        )
+    }
+
+    fn signed(add: &[u8], remove: &[u8], seq: u64, signers: &[u8]) -> DsseEnvelope {
         let mut r = rotation(&[], &[]);
         r.sequence = seq;
         r.add = add.iter().map(|s| fmt(*s)).collect();
@@ -115,41 +125,95 @@ mod apply {
         sign_rotation(&r, &refs).unwrap()
     }
 
+    fn apply1(current: &[u8], env: &DsseEnvelope) -> Result<AppliedRotation, RotationError> {
+        apply_rotation(&set(current), env, 0, ts(12), None)
+    }
+
+    fn apply2(current: &[u8], env: &DsseEnvelope) -> Result<AppliedRotation, RotationError> {
+        apply_rotation_with_threshold(&set(current), env, 0, ts(12), None, 2)
+    }
+
+    fn revoking(seeds: &[u8]) -> RevocationList {
+        RevocationList {
+            schema: REVOCATION_SCHEMA.into(),
+            issuer: "greentic".into(),
+            sequence: 1,
+            issued_at: ts(9),
+            valid_until: ts(23),
+            revoked_key_ids: seeds.iter().map(|s| key_id(&vk(*s))).collect(),
+            revoked_release_digests: vec![],
+        }
+    }
+
     #[test]
     fn a_trusted_key_rotates_in_a_new_key() {
-        let env = signed(&[2], &[], 1, &[1]);
-        let out = apply_rotation(TrustDomain::Execution, &[vk(1)], &env, 0, ts(12)).unwrap();
-        assert_eq!(out.keys, vec![vk(1), vk(2)]);
+        let out = apply1(&[1], &signed(&[2], &[], 1, &[1])).unwrap();
+        assert_eq!(out.keys, set(&[1, 2]));
         assert_eq!(out.rotation.sequence, 1);
-        assert_eq!(out.signer_key_ids.len(), 1);
+        assert_eq!(out.signer_key_ids, vec![key_id(&vk(1))]);
     }
 
     #[test]
-    fn a_signer_may_retire_itself_when_it_names_a_successor() {
-        let env = signed(&[2], &[1], 1, &[1]);
-        let out = apply_rotation(TrustDomain::Execution, &[vk(1)], &env, 0, ts(12)).unwrap();
-        assert_eq!(out.keys, vec![vk(2)]);
+    fn a_single_key_may_retire_itself() {
+        let out = apply1(&[1, 2], &signed(&[], &[1], 1, &[1])).unwrap();
+        assert_eq!(out.keys, set(&[2]));
+        let out = apply1(&[1], &signed(&[2], &[1], 1, &[1])).unwrap();
+        assert_eq!(out.keys, set(&[2]));
     }
 
     #[test]
-    fn removing_every_signer_without_a_replacement_is_refused() {
+    fn a_single_leaked_key_cannot_evict_its_peers() {
+        // H2: A holds {A, B, C} and signs `remove: [B, C]` alone.
+        let env = signed(&[], &[2, 3], 1, &[1]);
+        assert!(matches!(
+            apply1(&[1, 2, 3], &env),
+            Err(RotationError::RemovalNeedsQuorum(_))
+        ));
+        // Even with a replacement of its own.
+        let env = signed(&[9], &[2], 1, &[1]);
+        assert!(matches!(
+            apply1(&[1, 2, 3], &env),
+            Err(RotationError::RemovalNeedsQuorum(_))
+        ));
+    }
+
+    #[test]
+    fn a_quorum_of_two_may_remove_a_peer() {
+        let env = signed(&[], &[3], 1, &[1, 2]);
+        let out = apply2(&[1, 2, 3], &env).unwrap();
+        assert_eq!(out.keys, set(&[1, 2]));
+        // Two signers are not enough when the threshold asked for is 1.
+        assert!(matches!(
+            apply1(&[1, 2, 3], &env),
+            Err(RotationError::RemovalNeedsQuorum(_))
+        ));
+    }
+
+    #[test]
+    fn the_result_keeps_at_least_threshold_keys() {
+        let env = signed(&[], &[2], 1, &[1, 2]);
+        assert!(matches!(
+            apply2(&[1, 2], &env),
+            Err(RotationError::TooFewKeys {
+                required: 2,
+                remaining: 1
+            })
+        ));
         let env = signed(&[], &[1], 1, &[1]);
         assert!(matches!(
-            apply_rotation(TrustDomain::Execution, &[vk(1), vk(2)], &env, 0, ts(12)),
-            Err(RotationError::SignersRemovedWithoutReplacement)
+            apply1(&[1], &env),
+            Err(RotationError::TooFewKeys {
+                required: 1,
+                remaining: 0
+            })
         ));
-        // Removing a peer (not a signer) is fine.
-        let env = signed(&[], &[2], 1, &[1]);
-        let out = apply_rotation(TrustDomain::Execution, &[vk(1), vk(2)], &env, 0, ts(12)).unwrap();
-        assert_eq!(out.keys, vec![vk(1)]);
     }
 
     #[test]
     fn an_untrusted_signer_cannot_establish_its_own_authority() {
-        // Signed by key 9, which adds itself: the current set does not trust it.
         let env = signed(&[9], &[], 1, &[9]);
         assert!(matches!(
-            apply_rotation(TrustDomain::Execution, &[vk(1)], &env, 0, ts(12)),
+            apply1(&[1], &env),
             Err(RotationError::Envelope(OpenError::Signature(
                 VerifyError::NoTrustedSignature
             )))
@@ -158,32 +222,13 @@ mod apply {
 
     #[test]
     fn a_threshold_of_two_needs_two_current_signers() {
-        let env = signed(&[3], &[], 1, &[1]);
         assert!(matches!(
-            apply_rotation_with_threshold(
-                TrustDomain::Execution,
-                &[vk(1), vk(2)],
-                &env,
-                0,
-                ts(12),
-                2
-            ),
+            apply2(&[1, 2], &signed(&[3], &[], 1, &[1])),
             Err(RotationError::Envelope(OpenError::Signature(
                 VerifyError::BelowThreshold { .. }
             )))
         ));
-        let env = signed(&[3], &[], 1, &[1, 2]);
-        assert!(
-            apply_rotation_with_threshold(
-                TrustDomain::Execution,
-                &[vk(1), vk(2)],
-                &env,
-                0,
-                ts(12),
-                2
-            )
-            .is_ok()
-        );
+        assert!(apply2(&[1, 2], &signed(&[3], &[], 1, &[1, 2])).is_ok());
     }
 
     #[test]
@@ -191,7 +236,7 @@ mod apply {
         let env = signed(&[2], &[], 5, &[1]);
         for last in [5, 6] {
             assert!(matches!(
-                apply_rotation(TrustDomain::Execution, &[vk(1)], &env, last, ts(12)),
+                apply_rotation(&set(&[1]), &env, last, ts(12), None),
                 Err(RotationError::NotNewer { sequence: 5, .. })
             ));
         }
@@ -200,9 +245,10 @@ mod apply {
     #[test]
     fn another_domain_is_refused() {
         let env = signed(&[2], &[], 1, &[1]);
+        let vendor = TrustSet::new(TrustDomain::VendorRelease, vec![vk(1)]);
         assert!(matches!(
-            apply_rotation(TrustDomain::VendorRelease, &[vk(1)], &env, 0, ts(12)),
-            Err(RotationError::WrongDomain { .. })
+            apply_rotation(&vendor, &env, 0, ts(12), None),
+            Err(RotationError::Envelope(OpenError::WrongTrustDomain { .. }))
         ));
     }
 
@@ -211,7 +257,7 @@ mod apply {
         let env = signed(&[2], &[], 1, &[1]);
         for now in [ts(9), ts(20)] {
             assert!(matches!(
-                apply_rotation(TrustDomain::Execution, &[vk(1)], &env, 0, now),
+                apply_rotation(&set(&[1]), &env, 0, now, None),
                 Err(RotationError::NotApplicable)
             ));
         }
@@ -219,34 +265,36 @@ mod apply {
 
     #[test]
     fn unknown_removals_and_duplicate_adds_are_refused() {
-        let env = signed(&[], &[7], 1, &[1]);
         assert!(matches!(
-            apply_rotation(TrustDomain::Execution, &[vk(1)], &env, 0, ts(12)),
+            apply1(&[1], &signed(&[], &[7], 1, &[1])),
             Err(RotationError::UnknownRemoval(_))
         ));
-        let env = signed(&[1], &[], 1, &[1]);
         assert!(matches!(
-            apply_rotation(TrustDomain::Execution, &[vk(1)], &env, 0, ts(12)),
+            apply1(&[1], &signed(&[1], &[], 1, &[1])),
             Err(RotationError::AlreadyTrusted(_))
         ));
     }
 
     #[test]
-    fn a_rotation_never_leaves_an_empty_set() {
-        // Two signers each remove the other and themselves with no add:
-        // refused by the self-removal rule before the empty check.
-        let env = signed(&[], &[1, 2], 1, &[1, 2]);
+    fn revoked_keys_neither_sign_nor_get_added() {
+        let list = revoking(&[1]);
+        let env = signed(&[3], &[], 1, &[1]);
         assert!(matches!(
-            apply_rotation(TrustDomain::Execution, &[vk(1), vk(2)], &env, 0, ts(12)),
-            Err(RotationError::SignersRemovedWithoutReplacement)
+            apply_rotation(&set(&[1, 2]), &env, 0, ts(12), Some(&list)),
+            Err(RotationError::Envelope(OpenError::RevokedSigner(_)))
+        ));
+        let list = revoking(&[3]);
+        let env = signed(&[3], &[], 1, &[1]);
+        assert!(matches!(
+            apply_rotation(&set(&[1]), &env, 0, ts(12), Some(&list)),
+            Err(RotationError::AddsRevokedKey(_))
         ));
     }
 
     #[test]
     fn a_duplicated_current_set_is_deduplicated() {
-        let env = signed(&[2], &[], 1, &[1]);
-        let out = apply_rotation(TrustDomain::Execution, &[vk(1), vk(1)], &env, 0, ts(12)).unwrap();
-        assert_eq!(out.keys, vec![vk(1), vk(2)]);
+        let out = apply1(&[1, 1], &signed(&[2], &[], 1, &[1])).unwrap();
+        assert_eq!(out.keys, set(&[1, 2]));
     }
 
     #[test]
@@ -254,17 +302,15 @@ mod apply {
         let mut r = rotation(&["ed25519:not-base64!"], &[]);
         r.sequence = 1;
         let env = sign_rotation(&r, &[&key(1)]).unwrap();
-        assert!(matches!(
-            apply_rotation(TrustDomain::Execution, &[vk(1)], &env, 0, ts(12)),
-            Err(RotationError::BadKey(_))
-        ));
+        assert!(matches!(apply1(&[1], &env), Err(RotationError::BadKey(_))));
     }
 
     #[test]
     fn verify_rotation_inspects_without_applying() {
         let env = signed(&[2], &[], 3, &[1]);
-        let r = verify_rotation(&env, &[vk(1)], 1).unwrap();
-        assert_eq!(r.sequence, 3);
-        assert_eq!(r.add, vec![fmt(2)]);
+        let r = verify_rotation(&env, &set(&[1]), 1, None).unwrap();
+        assert_eq!(r.value.sequence, 3);
+        assert_eq!(r.value.add, vec![fmt(2)]);
+        assert_eq!(r.signer_keys, vec![vk(1)]);
     }
 }

@@ -27,6 +27,14 @@ pub use enums::{DeployTarget, EnvStatus, JobStatus};
 pub use timestamp::parse_lenient;
 pub use types::{DeploymentJob, EnvListItem, EnvOrigin, RunnerStatus};
 
+/// The largest `sequence` any signed stream in this crate accepts (trust
+/// rotations, revocation lists, status reports): 2^53 - 1, the largest
+/// integer every JSON consumer reads exactly. A stream that reached
+/// `u64::MAX` could never advance again (`sequence > last` is then
+/// unsatisfiable), so one buggy or compromised statement would freeze it
+/// for good; capping well below that keeps every stream advanceable.
+pub const MAX_SEQUENCE: u64 = (1 << 53) - 1;
+
 pub mod dsse;
 pub mod execution;
 pub mod governance;

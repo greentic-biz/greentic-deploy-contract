@@ -1,7 +1,7 @@
 use super::*;
 use crate::execution::tests::digest;
 use crate::release::{
-    Compatibility, Provenance, ReleaseArtifact, ReleaseKind, RollbackDeclaration,
+    Compatibility, Provenance, ReleaseArtifact, ReleaseKind, RollbackDeclaration, release_digest,
 };
 use chrono::TimeZone;
 use serde_json::json;
@@ -140,6 +140,14 @@ fn unsafe_paths_are_refused() {
         "files/x/",
         "files/..",
         "a\0b",
+        "C:/x",
+        "files/a:stream",
+        "files/line\nbreak",
+        "files/trailing.",
+        "files/with space",
+        "files/CON",
+        "files/nul.txt",
+        "files/café",
     ] {
         let mut m = sample();
         m.inventory[0].path = bad.into();
@@ -151,6 +159,18 @@ fn unsafe_paths_are_refused() {
 }
 
 #[test]
+fn path_length_limits() {
+    let mut m = sample();
+    m.inventory[0].path = format!("files/{}", "a".repeat(MAX_PATH_SEGMENT_BYTES));
+    assert_eq!(m.validate(), Ok(()));
+    m.inventory[0].path = format!("files/{}", "a".repeat(MAX_PATH_SEGMENT_BYTES + 1));
+    assert!(matches!(m.validate(), Err(OfflineError::UnsafePath(_))));
+    m.inventory[0].path = vec!["a".repeat(200); 21].join("/");
+    assert!(m.inventory[0].path.len() > MAX_PATH_BYTES);
+    assert!(matches!(m.validate(), Err(OfflineError::UnsafePath(_))));
+}
+
+#[test]
 fn a_dotted_file_name_is_not_traversal() {
     let mut m = sample();
     m.inventory[0].path = "files/..hidden/a..b".into();
@@ -158,9 +178,12 @@ fn a_dotted_file_name_is_not_traversal() {
 }
 
 #[test]
-fn a_duplicate_path_is_refused() {
+fn a_duplicate_path_is_refused_case_insensitively() {
     let mut m = sample();
     m.inventory[1].path = m.inventory[0].path.clone();
+    assert!(matches!(m.validate(), Err(OfflineError::DuplicatePath(_))));
+    let mut m = sample();
+    m.inventory[1].path = m.inventory[0].path.to_ascii_uppercase();
     assert!(matches!(m.validate(), Err(OfflineError::DuplicatePath(_))));
 }
 
@@ -243,6 +266,9 @@ fn a_closure_entry_must_match_the_pin_exactly() {
 #[test]
 fn a_packaged_digest_absent_from_the_inventory_is_refused() {
     let mut m = sample();
+    m.releases[0].request.dependencies[0].digest = Some(digest('e'));
+    m.releases[0].release_digest = release_digest(&m.releases[0].request).unwrap();
+    m.closure.entries[0].digest = Some(digest('e'));
     m.closure.entries[0].source = ClosureSource::Packaged {
         digest: digest('e'),
     };
@@ -274,9 +300,120 @@ fn an_internal_registry_source_needs_a_reference() {
     };
     assert_eq!(m.validate(), Err(OfflineError::EmptyOciRef));
     m.closure.entries[0].source = ClosureSource::InternalRegistry {
-        oci_ref: "registry.local/ext/llm-openai@sha256:x".into(),
+        oci_ref: format!("registry.local/ext/llm-openai@{}", digest('b')),
     };
     assert_eq!(m.validate(), Ok(()));
+}
+
+#[test]
+fn an_internal_registry_reference_must_be_digest_pinned_to_the_entry() {
+    let mut m = sample();
+    m.closure.entries[0].source = ClosureSource::InternalRegistry {
+        oci_ref: "registry.local/ext/llm-openai:1.0".into(),
+    };
+    assert!(matches!(m.validate(), Err(OfflineError::UnpinnedOciRef(_))));
+    m.closure.entries[0].source = ClosureSource::InternalRegistry {
+        oci_ref: format!("registry.local/ext/llm-openai@{}", digest('9')),
+    };
+    assert!(matches!(
+        m.validate(),
+        Err(OfflineError::SourceDigestMismatch(_))
+    ));
+}
+
+#[test]
+fn a_packaged_source_must_match_the_pinned_digest() {
+    let mut m = sample();
+    // `a` is in the inventory, but the entry pins `b`.
+    m.closure.entries[0].source = ClosureSource::Packaged {
+        digest: digest('a'),
+    };
+    assert!(matches!(
+        m.validate(),
+        Err(OfflineError::SourceDigestMismatch(_))
+    ));
+}
+
+#[test]
+fn a_duplicate_closure_entry_is_refused() {
+    let mut m = sample();
+    let mut dup = m.closure.entries[0].clone();
+    dup.source = ClosureSource::InternalRegistry {
+        oci_ref: format!("registry.local/x@{}", digest('b')),
+    };
+    m.closure.entries.push(dup);
+    assert!(matches!(
+        m.validate(),
+        Err(OfflineError::DuplicateClosureEntry(_))
+    ));
+}
+
+#[test]
+fn a_complete_package_carries_every_release_artifact() {
+    let mut m = sample();
+    m.inventory.remove(0);
+    m.max_unpacked_bytes = 50;
+    assert!(matches!(
+        m.validate(),
+        Err(OfflineError::ArtifactMissing { .. })
+    ));
+    // An inventory-based package may rely on its bound inventory.
+    m.mode = PackageMode::InventoryBased {
+        inventory_digest: digest('9'),
+    };
+    assert_eq!(m.validate(), Ok(()));
+}
+
+#[test]
+fn a_non_canonical_artifact_digest_is_refused() {
+    let mut m = sample();
+    let req = &mut m.releases[0].request;
+    req.artifacts[0].digest = "a".repeat(64);
+    m.releases[0].release_digest = release_digest(&m.releases[0].request).unwrap();
+    assert_eq!(
+        m.validate(),
+        Err(OfflineError::BadDigest("releases.request.artifacts.digest"))
+    );
+}
+
+#[test]
+fn an_artifact_target_must_be_a_declared_architecture() {
+    let mut m = sample();
+    m.releases[0].request.artifacts[0].target = Some("aarch64-unknown-linux-gnu".into());
+    m.releases[0].release_digest = release_digest(&m.releases[0].request).unwrap();
+    assert!(matches!(
+        m.validate(),
+        Err(OfflineError::UnsupportedTarget { .. })
+    ));
+    m.architectures.push("aarch64-unknown-linux-gnu".into());
+    assert_eq!(m.validate(), Ok(()));
+}
+
+#[test]
+fn duplicate_trust_material_is_refused() {
+    let mut m = sample();
+    m.trust_statements.push(digest('d'));
+    assert!(matches!(
+        m.validate(),
+        Err(OfflineError::DuplicateTrustMaterial(_))
+    ));
+    let mut m = sample();
+    m.trust_statements = vec![digest('c')];
+    assert!(matches!(
+        m.validate(),
+        Err(OfflineError::DuplicateTrustMaterial(_))
+    ));
+}
+
+#[test]
+fn admit_checks_audience_and_expiry() {
+    let m = sample();
+    assert_eq!(m.admit(ts(12), "inst-1"), Ok(()));
+    assert_eq!(
+        m.admit(ts(12), "inst-2"),
+        Err(OfflineAdmitError::NotForThisInstallation)
+    );
+    assert_eq!(m.admit(ts(20), "inst-1"), Err(OfflineAdmitError::Expired));
 }
 
 #[test]
@@ -293,8 +430,11 @@ fn max_unpacked_bytes_covers_the_inventory() {
     assert_eq!(m.validate(), Err(OfflineError::UnpackedSizeTooSmall));
     let mut m = sample();
     m.inventory[0].bytes = u64::MAX;
-    m.max_unpacked_bytes = u64::MAX;
+    m.max_unpacked_bytes = MAX_UNPACKED_BYTES;
     assert_eq!(m.validate(), Err(OfflineError::UnpackedSizeTooSmall));
+    let mut m = sample();
+    m.max_unpacked_bytes = MAX_UNPACKED_BYTES + 1;
+    assert_eq!(m.validate(), Err(OfflineError::UnpackedSizeTooLarge));
 }
 
 #[test]
@@ -324,83 +464,5 @@ fn the_wire_shape_is_tagged_snake_case() {
 }
 
 #[cfg(feature = "signing")]
-mod signing_tests {
-    use super::*;
-    use crate::dsse::VerifyError;
-    use crate::signed::{OpenError, SignError};
-    use ed25519_dalek::SigningKey;
-
-    fn key(seed: u8) -> SigningKey {
-        SigningKey::from_bytes(&[seed; 32])
-    }
-
-    #[test]
-    fn round_trips_two_of_two() {
-        let (a, b) = (key(1), key(2));
-        let env = sign_offline(&sample(), &[&a, &b]).unwrap();
-        assert_eq!(env.payload_type, OFFLINE_RELEASE_PAYLOAD_TYPE);
-        let trusted = [a.verifying_key(), b.verifying_key()];
-        assert_eq!(verify_offline(&env, &trusted, 2).unwrap(), sample());
-    }
-
-    #[test]
-    fn below_threshold_is_refused() {
-        let a = key(1);
-        let env = sign_offline(&sample(), &[&a]).unwrap();
-        let trusted = [a.verifying_key(), key(2).verifying_key()];
-        assert!(matches!(
-            verify_offline(&env, &trusted, 2),
-            Err(OpenError::Signature(VerifyError::BelowThreshold { .. }))
-        ));
-    }
-
-    #[test]
-    fn an_untrusted_signer_is_refused() {
-        let env = sign_offline(&sample(), &[&key(1)]).unwrap();
-        assert!(matches!(
-            verify_offline(&env, &[key(9).verifying_key()], 1),
-            Err(OpenError::Signature(VerifyError::NoTrustedSignature))
-        ));
-    }
-
-    #[test]
-    fn an_invalid_manifest_is_never_signed() {
-        let mut m = sample();
-        m.audience.installation_ids.clear();
-        assert!(matches!(
-            sign_offline(&m, &[&key(1)]),
-            Err(SignError::Invalid(OfflineError::EmptyAudience))
-        ));
-        assert!(matches!(
-            sign_offline(&sample(), &[]),
-            Err(SignError::NoKeys)
-        ));
-    }
-
-    #[test]
-    fn a_signed_but_invalid_payload_is_refused_after_the_signature() {
-        let mut m = sample();
-        m.audience.installation_ids.clear();
-        let payload = serde_json::to_vec(&m).unwrap();
-        let a = key(1);
-        let env = crate::dsse::sign_bytes(OFFLINE_RELEASE_PAYLOAD_TYPE, &payload, &[&a]);
-        assert!(matches!(
-            verify_offline(&env, &[a.verifying_key()], 1),
-            Err(OpenError::Invalid(OfflineError::EmptyAudience))
-        ));
-    }
-
-    #[test]
-    fn another_schema_type_is_refused() {
-        let a = key(1);
-        let env = crate::dsse::sign_bytes(
-            "application/vnd.greentic.status-report.v1+json",
-            &serde_json::to_vec(&sample()).unwrap(),
-            &[&a],
-        );
-        assert!(matches!(
-            verify_offline(&env, &[a.verifying_key()], 1),
-            Err(OpenError::Signature(VerifyError::WrongPayloadType))
-        ));
-    }
-}
+#[path = "offline_sign_tests.rs"]
+mod signing_tests;
