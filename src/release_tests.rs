@@ -86,12 +86,16 @@ fn sample_dependencies() -> Vec<DependencyPin> {
             name: "hubspot".into(),
             version_req: Some(">=1.0.0".into()),
             digest: Some(format!("sha256:{}", "d".repeat(64))),
+            shared: false,
+            coexistence: None,
         },
         DependencyPin {
             kind: DependencyKind::Runtime,
             name: "greentic-start".into(),
             version_req: Some(">=1.2.0".into()),
             digest: None,
+            shared: false,
+            coexistence: None,
         },
     ]
 }
@@ -267,4 +271,28 @@ fn a_migration_enters_the_digest() {
     assert_eq!(back, b);
     assert_eq!(b.validate_migration(), Ok(()));
     assert_eq!(a.validate_migration(), Ok(()));
+}
+
+#[test]
+fn dependency_policy_enters_the_digest_only_when_declared() {
+    let mut a = sample();
+    a.dependencies = sample_dependencies();
+    let mut b = a.clone();
+    b.dependencies[0].shared = true;
+    assert_ne!(release_digest(&a).ok(), release_digest(&b).ok());
+    let mut c = a.clone();
+    c.dependencies[1].coexistence = Some(Coexistence::Exclusive);
+    assert_ne!(release_digest(&a).ok(), release_digest(&c).ok());
+    let mut d = a.clone();
+    d.dependencies[1].coexistence = Some(Coexistence::SideBySide);
+    assert_ne!(release_digest(&c).ok(), release_digest(&d).ok());
+    // Order-independent, like the pins themselves.
+    let mut e = c.clone();
+    e.dependencies.reverse();
+    assert_eq!(release_digest(&c).ok(), release_digest(&e).ok());
+    let json = serde_json::to_value(&c).unwrap();
+    assert_eq!(json["dependencies"][1]["coexistence"], "exclusive");
+    assert!(json["dependencies"][0].get("shared").is_none());
+    let back: RegisterReleaseRequest = serde_json::from_value(json).unwrap();
+    assert_eq!(back, c);
 }

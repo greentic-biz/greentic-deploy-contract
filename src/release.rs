@@ -52,6 +52,40 @@ pub struct DependencyPin {
     pub version_req: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    /// The dependency is a service other applications in the environment
+    /// also use, so changing it is a coordinated change set rather than this
+    /// release's own business. Skipped when `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared: bool,
+    /// Whether two versions of this dependency can run side by side. `None`
+    /// is "not declared" (planning treats it as unknown, never as
+    /// side-by-side). Skipped when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coexistence: Option<Coexistence>,
+}
+
+/// Whether two versions of a dependency can run at once (design doc §7,
+/// "Packaging and shared dependencies").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coexistence {
+    /// Old and new versions can be installed and serve together.
+    SideBySide,
+    /// Only one version can exist, so every application using it moves
+    /// together.
+    Exclusive,
+}
+
+impl DependencyPin {
+    /// `true` when the pin declares nothing beyond identity — the shape every
+    /// pin had before `shared` / `coexistence` existed.
+    pub fn has_default_policy(&self) -> bool {
+        !self.shared && self.coexistence.is_none()
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +156,15 @@ pub struct ReleaseRecord {
     pub request: RegisterReleaseRequest,
 }
 
+type DependencyPolicy<'a> = (
+    DependencyKind,
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    bool,
+    Option<Coexistence>,
+);
+
 /// The content that names a release. Provenance and artifact `source` are
 /// deliberately excluded: a rebuild of identical bytes, or the same bytes
 /// served from a mirror, is the same release.
@@ -137,6 +180,10 @@ struct Canonical<'a> {
     abi: Option<&'a str>,
     required_capabilities: Vec<&'a str>,
     rollback_supported: bool,
+    /// `(kind, name, version_req, digest, shared, coexistence)` for pins that
+    /// declare a policy; skipped when none does, so older digests do not move.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dependency_policies: Vec<DependencyPolicy<'a>>,
     /// Skipped when absent, so pre-migration digests do not move.
     #[serde(skip_serializing_if = "Option::is_none")]
     migration: Option<&'a MigrationDeclaration>,
@@ -169,6 +216,22 @@ pub fn release_digest(req: &RegisterReleaseRequest) -> Result<String, serde_json
         })
         .collect();
     dependencies.sort();
+    let mut dependency_policies: Vec<DependencyPolicy<'_>> = req
+        .dependencies
+        .iter()
+        .filter(|d| !d.has_default_policy())
+        .map(|d| {
+            (
+                d.kind,
+                d.name.as_str(),
+                d.version_req.as_deref(),
+                d.digest.as_deref(),
+                d.shared,
+                d.coexistence,
+            )
+        })
+        .collect();
+    dependency_policies.sort();
     let mut required_capabilities: Vec<&str> = req
         .compatibility
         .required_capabilities
@@ -188,6 +251,7 @@ pub fn release_digest(req: &RegisterReleaseRequest) -> Result<String, serde_json
         abi: req.compatibility.abi.as_deref(),
         required_capabilities,
         rollback_supported: req.rollback.supported,
+        dependency_policies,
         migration: req.migration.as_ref(),
     };
     let bytes = serde_json::to_vec(&canonical)?;

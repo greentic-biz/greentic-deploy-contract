@@ -29,6 +29,8 @@ fn request() -> RegisterReleaseRequest {
             name: "greentic.llm-openai".into(),
             version_req: Some("^1".into()),
             digest: Some(digest('b')),
+            shared: false,
+            coexistence: None,
         }],
         compatibility: Compatibility::default(),
         provenance: Provenance {
