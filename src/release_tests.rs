@@ -40,6 +40,7 @@ fn sample() -> RegisterReleaseRequest {
             supported: true,
             notes: None,
         },
+        migration: None,
     }
 }
 
@@ -224,4 +225,46 @@ fn request_round_trips_through_json() {
     let back: RegisterReleaseRequest = serde_json::from_str(&s).expect("deserialize");
     assert_eq!(back, sample());
     assert!(s.contains("\"kind\":\"application\""));
+}
+
+/// Captured BEFORE the migration field existed. An absent migration must
+/// leave both the wire JSON and the digest byte-identical.
+#[test]
+fn existing_requests_keep_their_digest_and_bytes() {
+    let mut s = sample();
+    assert_eq!(
+        release_digest(&s).unwrap(),
+        "sha256:08ee234c3285bc4a0bcc128c33cdba1ab284f3f2d2ec4959f34156ed1bcdb6fd"
+    );
+    assert_eq!(
+        serde_json::to_string(&s).unwrap(),
+        r#"{"kind":"application","publisher":"tenant:acme","name":"guest-assistant","version":"2.4.0","artifacts":[{"name":"b.gtpack","version":"2.4.0","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"name":"a.gtpack","version":"2.4.0","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"dependencies":[],"compatibility":{"required_capabilities":["z","a"]},"provenance":{"source_revision":"s1","builder":"designer"},"rollback":{"supported":true}}"#
+    );
+    s.dependencies = sample_dependencies();
+    assert_eq!(
+        release_digest(&s).unwrap(),
+        "sha256:0fd322b1bd97aa10dce17c356148f88fcbb35cda4e0b840c8b4f2303e56796af"
+    );
+    assert_eq!(
+        serde_json::to_string(&s).unwrap(),
+        r#"{"kind":"application","publisher":"tenant:acme","name":"guest-assistant","version":"2.4.0","artifacts":[{"name":"b.gtpack","version":"2.4.0","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"name":"a.gtpack","version":"2.4.0","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"dependencies":[{"kind":"extension","name":"hubspot","version_req":">=1.0.0","digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},{"kind":"runtime","name":"greentic-start","version_req":">=1.2.0"}],"compatibility":{"required_capabilities":["z","a"]},"provenance":{"source_revision":"s1","builder":"designer"},"rollback":{"supported":true}}"#
+    );
+}
+
+#[test]
+fn a_migration_enters_the_digest() {
+    let a = sample();
+    let mut b = sample();
+    b.migration = Some(crate::migration::tests::declaration());
+    assert_ne!(release_digest(&a).ok(), release_digest(&b).ok());
+    let mut c = b.clone();
+    if let Some(m) = c.migration.as_mut() {
+        m.to_schema = "v4".into();
+    }
+    assert_ne!(release_digest(&b).ok(), release_digest(&c).ok());
+    let json = serde_json::to_string(&b).unwrap();
+    let back: RegisterReleaseRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, b);
+    assert_eq!(b.validate_migration(), Ok(()));
+    assert_eq!(a.validate_migration(), Ok(()));
 }

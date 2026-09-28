@@ -41,6 +41,7 @@ pub mod execution_v2;
 pub mod governance;
 pub mod health;
 pub mod inventory;
+pub mod migration;
 pub mod offline;
 pub mod release;
 pub mod revocation;

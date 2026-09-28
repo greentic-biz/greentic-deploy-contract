@@ -184,6 +184,13 @@ impl OfflineReleaseManifest {
                     entry.release_id.clone(),
                 ));
             }
+            entry
+                .request
+                .validate_migration()
+                .map_err(|error| OfflineError::BadMigration {
+                    release_id: entry.release_id.clone(),
+                    error,
+                })?;
             for artifact in &entry.request.artifacts {
                 digest(&artifact.digest, "releases.request.artifacts.digest")?;
                 if complete && !inventory.contains(artifact.digest.as_str()) {

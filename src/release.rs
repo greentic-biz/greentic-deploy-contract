@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use crate::migration::{MigrationDeclaration, MigrationError};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseKind {
@@ -94,6 +96,20 @@ pub struct RegisterReleaseRequest {
     pub compatibility: Compatibility,
     pub provenance: Provenance,
     pub rollback: RollbackDeclaration,
+    /// The data migration this release performs, if any. Absent, it is not
+    /// serialised and does not enter [`release_digest`], so every release
+    /// registered before the field existed keeps its digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<MigrationDeclaration>,
+}
+
+impl RegisterReleaseRequest {
+    /// Validate the optional migration declaration; `Ok` when there is none.
+    pub fn validate_migration(&self) -> Result<(), MigrationError> {
+        self.migration
+            .as_ref()
+            .map_or(Ok(()), MigrationDeclaration::validate)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +137,9 @@ struct Canonical<'a> {
     abi: Option<&'a str>,
     required_capabilities: Vec<&'a str>,
     rollback_supported: bool,
+    /// Skipped when absent, so pre-migration digests do not move.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migration: Option<&'a MigrationDeclaration>,
 }
 
 pub fn release_digest(req: &RegisterReleaseRequest) -> Result<String, serde_json::Error> {
@@ -169,6 +188,7 @@ pub fn release_digest(req: &RegisterReleaseRequest) -> Result<String, serde_json
         abi: req.compatibility.abi.as_deref(),
         required_capabilities,
         rollback_supported: req.rollback.supported,
+        migration: req.migration.as_ref(),
     };
     let bytes = serde_json::to_vec(&canonical)?;
     Ok(format!("sha256:{}", hex_lower(&Sha256::digest(&bytes))))
