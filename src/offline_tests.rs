@@ -43,7 +43,7 @@ fn request() -> RegisterReleaseRequest {
             supported: true,
             notes: None,
         },
-        migration: None,
+        migrations: Vec::new(),
     }
 }
 
@@ -475,10 +475,7 @@ fn an_invalid_migration_declaration_is_refused() {
     let mut m = sample();
     let mut decl = crate::migration::tests::declaration();
     decl.reversible = false;
-    m.releases[0].request.migration = Some(decl);
+    m.releases[0].request.migrations = vec![decl];
     m.releases[0].release_digest = release_digest(&m.releases[0].request).unwrap();
-    assert!(matches!(
-        m.validate(),
-        Err(OfflineError::BadMigration { .. })
-    ));
+    assert!(matches!(m.validate(), Err(OfflineError::BadRequest { .. })));
 }

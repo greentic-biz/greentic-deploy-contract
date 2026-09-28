@@ -15,7 +15,7 @@
 //! Omission is never deletion (P5-R1): a unit missing from an `update` is
 //! left untouched. Only a `remove` authorisation removes, and removal is a
 //! sequence — clear the split, drain for `drain_seconds`, archive, remove —
-//! whose data is preserved when `retain_data` is set (P5-R2).
+//! whose data is always preserved under retention (P5-R2, [`DataDisposition`]).
 //!
 //! A receiver that accepts both versions uses [`VerifiedAuthorisation`] (and,
 //! with the `signing` feature, `verify_any`), which dispatches on the DSSE
@@ -44,7 +44,7 @@ pub const MAX_DRAIN_SECONDS: u32 = 3600;
 /// What a v2 authorisation asks the designer to do.
 ///
 /// Serialises as `"update"`, `"rollback"`, or
-/// `{"remove": {"retain_data": .., "drain_seconds": ..}}`. No
+/// `{"remove": {"data": "retain", "drain_seconds": ..}}`. No
 /// `#[serde(other)]`: an operation this build does not know fails to parse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -54,14 +54,28 @@ pub enum ExecOperationV2 {
     /// Retire the listed units: clear their traffic split, drain for
     /// `drain_seconds`, archive, then remove.
     Remove {
-        /// Keep the units' data under retention. Destroying data is a
-        /// separate workflow; `false` only means "this operation does not
-        /// promise retention", never "delete the data now".
-        retain_data: bool,
+        /// What happens to the units' data. Always [`DataDisposition::Retain`]
+        /// in v2.
+        data: DataDisposition,
         /// How long to wait for in-flight work after traffic is cleared,
-        /// `0..=`[`MAX_DRAIN_SECONDS`].
+        /// `0..=`[`MAX_DRAIN_SECONDS`]. `0` means "clear the split and retire
+        /// with no wait" — the drain step of the sequence is then a no-op.
         drain_seconds: u32,
     },
+}
+
+/// What a removal does with the removed units' data.
+///
+/// Only [`Self::Retain`] exists, on purpose: a boolean here would let an
+/// executor read `false` as "delete". Destroying data is a SEPARATE, future,
+/// separately authorised workflow (P5-R2) with its own schema; it will never
+/// be expressed by adding a variant a v2 signer could already mint. No
+/// `#[serde(other)]`: an unknown disposition fails to parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataDisposition {
+    /// Keep the data under the environment's retention policy.
+    Retain,
 }
 
 impl From<ExecOperation> for ExecOperationV2 {
@@ -78,7 +92,9 @@ impl From<ExecOperation> for ExecOperationV2 {
 ///
 /// For a `remove`, each unit's `expected_baseline` is what is running now
 /// (a `bundle_digest` is required: a unit that was never deployed cannot be
-/// removed) and `target` is empty (every digest `None`).
+/// removed), `target` is empty (every digest `None`), and `traffic.steps`
+/// is exactly `[100]` — a removal splits nothing, and a percentage "removal"
+/// would imply a split no executor runs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionAuthorisationV2 {
@@ -115,21 +131,26 @@ pub enum ValidationErrorV2 {
     RemoveNothingDeployed(String),
     /// `drain_seconds` exceeds [`MAX_DRAIN_SECONDS`].
     DrainTooLong,
+    /// A `remove` whose `traffic.steps` is not exactly `[100]`.
+    RemoveTrafficSplit,
 }
 
 impl std::fmt::Display for ValidationErrorV2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Common(e) => e.fmt(f),
+            Self::Common(e) => write!(f, "v2 authorisation: {e}"),
             Self::RemoveTargetNotEmpty(u) => {
-                write!(f, "remove unit `{u}` names a target; a removal has none")
+                write!(f, "v2 remove unit `{u}` names a target; a removal has none")
             }
             Self::RemoveNothingDeployed(u) => write!(
                 f,
-                "remove unit `{u}` has no expected bundle_digest; nothing deployed can be removed"
+                "v2 remove unit `{u}` has no expected bundle_digest; nothing deployed can be removed"
             ),
             Self::DrainTooLong => {
-                write!(f, "drain_seconds exceeds {MAX_DRAIN_SECONDS}")
+                write!(f, "v2 remove: drain_seconds exceeds {MAX_DRAIN_SECONDS}")
+            }
+            Self::RemoveTrafficSplit => {
+                f.write_str("v2 remove: traffic steps must be exactly [100]")
             }
         }
     }
@@ -176,6 +197,9 @@ impl ExecutionAuthorisationV2 {
             if drain_seconds > MAX_DRAIN_SECONDS {
                 return Err(ValidationErrorV2::DrainTooLong);
             }
+            if self.traffic.steps != [100] {
+                return Err(ValidationErrorV2::RemoveTrafficSplit);
+            }
             for unit in &self.units {
                 if unit.expected_baseline.bundle_digest.is_none() {
                     return Err(ValidationErrorV2::RemoveNothingDeployed(
@@ -196,7 +220,15 @@ impl ExecutionAuthorisationV2 {
 /// A verified authorisation of either schema version. The accessors read the
 /// fields both versions share; [`Self::operation`] maps v1's operation into
 /// the v2 vocabulary, so a receiver matches on one enum.
+///
+/// `#[non_exhaustive]`: a v3 adds a variant without breaking consumers,
+/// whose wildcard arm must REFUSE, never execute.
+///
+/// v1 and v2 share ONE sequence stream per `(installation_id,
+/// environment_id)`: a receiver's replay check must key on
+/// [`Self::sequence`] regardless of version.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum VerifiedAuthorisation {
     V1(ExecutionAuthorisation),
     V2(ExecutionAuthorisationV2),

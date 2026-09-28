@@ -218,10 +218,10 @@ pub enum OfflineError {
     BadDigest(&'static str),
     /// `release_digest` does not equal the digest of `request`.
     ReleaseDigestMismatch(String),
-    /// A release's migration declaration fails its own validation.
-    BadMigration {
+    /// A release's request fails [`RegisterReleaseRequest::validate`].
+    BadRequest {
         release_id: String,
-        error: crate::migration::MigrationError,
+        error: crate::release::ReleaseRequestError,
     },
     /// A `complete` package lacks an artifact of one of its releases.
     ArtifactMissing {
@@ -277,8 +277,8 @@ impl std::fmt::Display for OfflineError {
             Self::ReleaseDigestMismatch(id) => {
                 write!(f, "release `{id}` digest does not match its request")
             }
-            Self::BadMigration { release_id, error } => {
-                write!(f, "release `{release_id}` migration: {error}")
+            Self::BadRequest { release_id, error } => {
+                write!(f, "release `{release_id}`: {error}")
             }
             Self::ArtifactMissing { release_id, digest } => write!(
                 f,

@@ -77,6 +77,19 @@ pub enum Coexistence {
 }
 
 impl DependencyPin {
+    /// A pin with no digest and the default policy (not shared, coexistence
+    /// undeclared). Set the optional fields on the result.
+    pub fn new(kind: DependencyKind, name: impl Into<String>, version_req: Option<String>) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+            version_req,
+            digest: None,
+            shared: false,
+            coexistence: None,
+        }
+    }
+
     /// `true` when the pin declares nothing beyond identity — the shape every
     /// pin had before `shared` / `coexistence` existed.
     pub fn has_default_policy(&self) -> bool {
@@ -130,19 +143,56 @@ pub struct RegisterReleaseRequest {
     pub compatibility: Compatibility,
     pub provenance: Provenance,
     pub rollback: RollbackDeclaration,
-    /// The data migration this release performs, if any. Absent, it is not
-    /// serialised and does not enter [`release_digest`], so every release
-    /// registered before the field existed keeps its digest.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub migration: Option<MigrationDeclaration>,
+    /// The data migrations this release performs, in execution order. Empty,
+    /// it is not serialised and does not enter [`release_digest`], so every
+    /// release registered before the field existed keeps its digest. The
+    /// order is part of the digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub migrations: Vec<MigrationDeclaration>,
 }
 
+/// Why a [`RegisterReleaseRequest`] refuses to validate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReleaseRequestError {
+    /// `migrations[index]` fails its own validation.
+    Migration { index: usize, error: MigrationError },
+    /// `migrations[index]` migrates an owner whose previous declaration in
+    /// the list ended at a different schema than this one starts from.
+    MigrationChainBroken { index: usize },
+}
+
+impl std::fmt::Display for ReleaseRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Migration { index, error } => write!(f, "migrations[{index}]: {error}"),
+            Self::MigrationChainBroken { index } => write!(
+                f,
+                "migrations[{index}] does not start where the owner's previous migration ended"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReleaseRequestError {}
+
 impl RegisterReleaseRequest {
-    /// Validate the optional migration declaration; `Ok` when there is none.
-    pub fn validate_migration(&self) -> Result<(), MigrationError> {
-        self.migration
-            .as_ref()
-            .map_or(Ok(()), MigrationDeclaration::validate)
+    /// Refuse a request whose declarations contradict themselves. Every
+    /// registration path (the admin's catalogue, the designer's
+    /// `release_register`, offline import) must call this BEFORE computing
+    /// or trusting [`release_digest`], which digests whatever it is given.
+    pub fn validate(&self) -> Result<(), ReleaseRequestError> {
+        let mut last_to: std::collections::BTreeMap<&str, &str> = Default::default();
+        for (index, m) in self.migrations.iter().enumerate() {
+            m.validate()
+                .map_err(|error| ReleaseRequestError::Migration { index, error })?;
+            if let Some(prev) = last_to.insert(&m.owner, &m.to_schema)
+                && prev != m.from_schema
+            {
+                return Err(ReleaseRequestError::MigrationChainBroken { index });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -184,9 +234,9 @@ struct Canonical<'a> {
     /// declare a policy; skipped when none does, so older digests do not move.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     dependency_policies: Vec<DependencyPolicy<'a>>,
-    /// Skipped when absent, so pre-migration digests do not move.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    migration: Option<&'a MigrationDeclaration>,
+    /// Skipped when empty, so pre-migration digests do not move.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    migrations: &'a [MigrationDeclaration],
 }
 
 pub fn release_digest(req: &RegisterReleaseRequest) -> Result<String, serde_json::Error> {
@@ -252,7 +302,7 @@ pub fn release_digest(req: &RegisterReleaseRequest) -> Result<String, serde_json
         required_capabilities,
         rollback_supported: req.rollback.supported,
         dependency_policies,
-        migration: req.migration.as_ref(),
+        migrations: &req.migrations,
     };
     let bytes = serde_json::to_vec(&canonical)?;
     Ok(format!("sha256:{}", hex_lower(&Sha256::digest(&bytes))))

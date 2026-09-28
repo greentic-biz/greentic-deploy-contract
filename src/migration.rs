@@ -3,11 +3,11 @@
 //!
 //! A release that changes the shape of data it owns declares it here, so a
 //! rollout can present the limitation before approval and a rollback can be
-//! refused across a committed irreversible migration. The declaration is an
-//! OPTIONAL field of [`RegisterReleaseRequest`](crate::release::RegisterReleaseRequest):
-//! absent, it is not serialised and does not enter
-//! [`release_digest`](crate::release::release_digest), so every release
-//! registered before it existed keeps its digest byte for byte.
+//! refused across a committed irreversible migration. Declarations are an
+//! ORDERED list on [`RegisterReleaseRequest`](crate::release::RegisterReleaseRequest)
+//! (`migrations`, in execution order): empty, it is not serialised and does
+//! not enter [`release_digest`](crate::release::release_digest), so every
+//! release registered before it existed keeps its digest byte for byte.
 //!
 //! Restoring a database backup is NOT code rollback, and nothing here models
 //! it: that is a separate recovery action with its own data-loss
@@ -21,8 +21,11 @@ use crate::execution::is_clean_identifier;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LockScope {
-    /// Online: old and new code keep reading and writing throughout.
-    None,
+    /// Online: old and new code keep reading and writing throughout. Named
+    /// `Online` so it cannot shadow `Option::None` under a glob import; the
+    /// wire value is `"none"`.
+    #[serde(rename = "none")]
+    Online,
     /// Only the data of the one application being migrated.
     Application,
     /// Every application in the deployment unit.
@@ -32,6 +35,10 @@ pub enum LockScope {
 }
 
 /// One schema change a release makes. See the module doc.
+///
+/// **Digest rule:** the whole declaration enters `release_digest`. A new
+/// field added later MUST be `Option` + `skip_serializing_if`, or it moves
+/// the digest of every release that carries a declaration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MigrationDeclaration {
@@ -151,25 +158,34 @@ impl std::fmt::Display for RollbackBlockReason {
     }
 }
 
-/// Whether ordinary rollback across this COMMITTED migration is blocked, and
-/// why. `None` means a code rollback is safe. Irreversibility outranks
-/// old-code incompatibility. Pure; whether the migration has committed is
-/// the caller's journal to consult.
-pub fn rollback_blocked(migration: &MigrationDeclaration) -> Option<RollbackBlockReason> {
-    if !migration.reversible {
+/// Whether ordinary rollback across these COMMITTED migrations is blocked,
+/// and why. `None` means a code rollback is safe. Every declaration is
+/// considered: the first irreversible one (in order) outranks any old-code
+/// incompatibility. Pure; which migrations have committed is the caller's
+/// journal to consult — pass only those.
+pub fn rollback_blocked(migrations: &[MigrationDeclaration]) -> Option<RollbackBlockReason> {
+    if let Some(m) = migrations.iter().find(|m| !m.reversible) {
         return Some(RollbackBlockReason::Irreversible {
-            from_schema: migration.from_schema.clone(),
-            to_schema: migration.to_schema.clone(),
-            forward_recovery_ref: migration.forward_recovery_ref.clone(),
+            from_schema: m.from_schema.clone(),
+            to_schema: m.to_schema.clone(),
+            forward_recovery_ref: m.forward_recovery_ref.clone(),
         });
     }
-    if !migration.old_code_compatible {
-        return Some(RollbackBlockReason::OldCodeIncompatible {
-            from_schema: migration.from_schema.clone(),
-            to_schema: migration.to_schema.clone(),
-        });
-    }
-    None
+    migrations.iter().find(|m| !m.old_code_compatible).map(|m| {
+        RollbackBlockReason::OldCodeIncompatible {
+            from_schema: m.from_schema.clone(),
+            to_schema: m.to_schema.clone(),
+        }
+    })
+}
+
+/// The first migration that makes old and new revisions unsafe to run side
+/// by side on the migrated data (`old_code_compatible == false`), if any. A
+/// percentage rollout (traffic steps other than `[100]`) of such a release
+/// must be refused: during the split, the old revision serves against data
+/// it cannot read.
+pub fn coexistence_blocked(migrations: &[MigrationDeclaration]) -> Option<&MigrationDeclaration> {
+    migrations.iter().find(|m| !m.old_code_compatible)
 }
 
 #[cfg(test)]

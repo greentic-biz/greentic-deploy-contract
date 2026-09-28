@@ -186,8 +186,8 @@ impl OfflineReleaseManifest {
             }
             entry
                 .request
-                .validate_migration()
-                .map_err(|error| OfflineError::BadMigration {
+                .validate()
+                .map_err(|error| OfflineError::BadRequest {
                     release_id: entry.release_id.clone(),
                     error,
                 })?;

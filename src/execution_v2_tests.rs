@@ -27,12 +27,13 @@ pub(crate) fn sample_v2(operation: ExecOperationV2) -> ExecutionAuthorisationV2 
 
 pub(crate) fn remove_sample() -> ExecutionAuthorisationV2 {
     let mut a = sample_v2(ExecOperationV2::Remove {
-        retain_data: true,
+        data: DataDisposition::Retain,
         drain_seconds: 120,
     });
     for u in &mut a.units {
         u.target = UnitBaseline::default();
     }
+    a.traffic.steps = vec![100];
     a
 }
 
@@ -47,7 +48,7 @@ fn remove_serialises_as_a_tagged_object() {
     let v = serde_json::to_value(remove_sample()).unwrap();
     assert_eq!(
         v["operation"],
-        json!({"remove": {"retain_data": true, "drain_seconds": 120}})
+        json!({"remove": {"data": "retain", "drain_seconds": 120}})
     );
     assert_eq!(
         serde_json::to_value(ExecOperationV2::Update).unwrap(),
@@ -58,11 +59,17 @@ fn remove_serialises_as_a_tagged_object() {
 #[test]
 fn unknown_fields_in_remove_do_not_parse() {
     let r: Result<ExecOperationV2, _> = serde_json::from_value(
-        json!({"remove": {"retain_data": true, "drain_seconds": 1, "purge": true}}),
+        json!({"remove": {"data": "retain", "drain_seconds": 1, "purge": true}}),
     );
     assert!(r.is_err());
     let r: Result<ExecOperationV2, _> = serde_json::from_value(json!("destroy"));
     assert!(r.is_err());
+    // No boolean, no "delete": a disposition other than retain does not parse.
+    for data in [json!("delete"), json!(false), json!(true)] {
+        let r: Result<ExecOperationV2, _> =
+            serde_json::from_value(json!({"remove": {"data": data, "drain_seconds": 1}}));
+        assert!(r.is_err());
+    }
 }
 
 #[test]
@@ -78,7 +85,7 @@ fn v1_schema_does_not_validate_as_v2() {
 #[test]
 fn v1_does_not_accept_remove() {
     let mut v = serde_json::to_value(v1_sample()).unwrap();
-    v["operation"] = json!({"remove": {"retain_data": true, "drain_seconds": 1}});
+    v["operation"] = json!({"remove": {"data": "retain", "drain_seconds": 1}});
     assert!(serde_json::from_value::<crate::execution::ExecutionAuthorisation>(v).is_err());
 }
 
@@ -86,10 +93,21 @@ fn v1_does_not_accept_remove() {
 fn remove_rules() {
     let mut a = remove_sample();
     a.operation = ExecOperationV2::Remove {
-        retain_data: false,
+        data: DataDisposition::Retain,
         drain_seconds: MAX_DRAIN_SECONDS + 1,
     };
     assert_eq!(a.validate(), Err(ValidationErrorV2::DrainTooLong));
+
+    let mut a = remove_sample();
+    a.traffic.steps = vec![50, 100];
+    assert_eq!(a.validate(), Err(ValidationErrorV2::RemoveTrafficSplit));
+
+    let mut a = remove_sample();
+    a.operation = ExecOperationV2::Remove {
+        data: DataDisposition::Retain,
+        drain_seconds: 0,
+    };
+    assert_eq!(a.validate(), Ok(()));
 
     let mut a = remove_sample();
     a.units[0].target.bundle_digest = Some(digest('e'));

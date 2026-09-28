@@ -24,15 +24,22 @@ fn an_ownership_without_versions_serialises_as_before() {
 }
 
 #[test]
-fn versions_round_trip_and_must_name_owned_resources() {
+fn versions_round_trip() {
     let mut o = ownership();
     o.owned_resource_versions
         .insert("pack:guest".into(), "2.4.0".into());
     let back: ApplicationOwnership =
         serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
     assert_eq!(back, o);
-    assert_eq!(o.unowned_versioned_resource(), None);
-    o.owned_resource_versions
-        .insert("secret-ref:other".into(), "1".into());
-    assert_eq!(o.unowned_versioned_resource(), Some("secret-ref:other"));
+}
+
+#[test]
+fn default_is_the_empty_ownership() {
+    let o = ApplicationOwnership {
+        application_id: "app-1".into(),
+        release_digest: format!("sha256:{}", "a".repeat(64)),
+        owned_resources: vec!["pack:guest".into(), "flow:main".into()],
+        ..Default::default()
+    };
+    assert_eq!(o, ownership());
 }

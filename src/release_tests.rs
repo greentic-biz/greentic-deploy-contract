@@ -40,7 +40,7 @@ fn sample() -> RegisterReleaseRequest {
             supported: true,
             notes: None,
         },
-        migration: None,
+        migrations: Vec::new(),
     }
 }
 
@@ -256,21 +256,54 @@ fn existing_requests_keep_their_digest_and_bytes() {
 }
 
 #[test]
-fn a_migration_enters_the_digest() {
+fn migrations_enter_the_digest_in_order() {
+    use crate::migration::tests::declaration;
     let a = sample();
     let mut b = sample();
-    b.migration = Some(crate::migration::tests::declaration());
+    b.migrations = vec![declaration()];
     assert_ne!(release_digest(&a).ok(), release_digest(&b).ok());
     let mut c = b.clone();
-    if let Some(m) = c.migration.as_mut() {
-        m.to_schema = "v4".into();
-    }
+    c.migrations[0].to_schema = "v4".into();
     assert_ne!(release_digest(&b).ok(), release_digest(&c).ok());
     let json = serde_json::to_string(&b).unwrap();
     let back: RegisterReleaseRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(back, b);
-    assert_eq!(b.validate_migration(), Ok(()));
-    assert_eq!(a.validate_migration(), Ok(()));
+    assert_eq!(a.validate(), Ok(()));
+    assert_eq!(b.validate(), Ok(()));
+
+    // Two owners: order is part of the digest.
+    let mut other = declaration();
+    other.owner = "app:billing".into();
+    let mut d = sample();
+    d.migrations = vec![declaration(), other.clone()];
+    let mut e = sample();
+    e.migrations = vec![other, declaration()];
+    assert_eq!(d.validate(), Ok(()));
+    assert_ne!(release_digest(&d).ok(), release_digest(&e).ok());
+}
+
+#[test]
+fn a_migration_chain_must_be_continuous_per_owner() {
+    use crate::migration::tests::declaration;
+    let mut next = declaration();
+    next.from_schema = "v3".into();
+    next.to_schema = "v4".into();
+    let mut r = sample();
+    r.migrations = vec![declaration(), next.clone()];
+    assert_eq!(r.validate(), Ok(()));
+    next.from_schema = "v9".into();
+    r.migrations = vec![declaration(), next];
+    assert_eq!(
+        r.validate(),
+        Err(ReleaseRequestError::MigrationChainBroken { index: 1 })
+    );
+    let mut bad = declaration();
+    bad.reversible = false;
+    r.migrations = vec![bad];
+    assert!(matches!(
+        r.validate(),
+        Err(ReleaseRequestError::Migration { index: 0, .. })
+    ));
 }
 
 #[test]
@@ -295,4 +328,15 @@ fn dependency_policy_enters_the_digest_only_when_declared() {
     assert!(json["dependencies"][0].get("shared").is_none());
     let back: RegisterReleaseRequest = serde_json::from_value(json).unwrap();
     assert_eq!(back, c);
+}
+
+#[test]
+fn dependency_pin_new_has_the_default_policy() {
+    let p = DependencyPin::new(
+        DependencyKind::Runtime,
+        "greentic-start",
+        Some(">=1.2.0".into()),
+    );
+    assert_eq!(p, sample_dependencies()[1]);
+    assert!(p.has_default_policy());
 }

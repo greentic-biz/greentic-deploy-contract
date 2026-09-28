@@ -1,4 +1,5 @@
 use super::*;
+use crate::execution_v2::DataDisposition;
 use serde_json::json;
 
 fn demand(operation: ExecOperationV2, steps: &[u8]) -> PlanDemand<'_> {
@@ -42,15 +43,15 @@ fn a_percentage_rollout_needs_traffic_split() {
 #[test]
 fn a_removal_needs_remove_and_drain_when_draining() {
     let op = ExecOperationV2::Remove {
-        retain_data: true,
+        data: DataDisposition::Retain,
         drain_seconds: 60,
     };
     assert_eq!(
-        required_capabilities_for(&demand(op, &[10, 100])),
+        required_capabilities_for(&demand(op, &[100])),
         vec![DRAIN, REMOVE]
     );
     let op = ExecOperationV2::Remove {
-        retain_data: true,
+        data: DataDisposition::Retain,
         drain_seconds: 0,
     };
     assert_eq!(required_capabilities_for(&demand(op, &[100])), vec![REMOVE]);

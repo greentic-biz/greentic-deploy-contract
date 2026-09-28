@@ -137,7 +137,7 @@ mod signing {
         /// Some trusted keys signed, but fewer DISTINCT ones than the
         /// threshold asked for.
         BelowThreshold { required: usize, found: usize },
-        /// The signed bytes are not a v1 authorisation (malformed JSON, an
+        /// The signed bytes are not a valid authorisation of the expected version (malformed JSON, an
         /// unknown field, an unknown operation).
         BadPayload(serde_json::Error),
         /// The authorisation parsed but fails [`ExecutionAuthorisation::validate`].
@@ -165,9 +165,11 @@ mod signing {
                     write!(f, "envelope carries more than {MAX_SIGNATURES} signatures")
                 }
                 Self::NoTrustedSignature => f.write_str("no signature from a trusted key"),
-                Self::BadPayload(e) => write!(f, "payload is not a v1 authorisation: {e}"),
+                Self::BadPayload(e) => {
+                    write!(f, "payload is not a valid execution authorisation: {e}")
+                }
                 Self::Invalid(e) => write!(f, "authorisation is invalid: {e}"),
-                Self::InvalidV2(e) => write!(f, "authorisation is invalid: {e}"),
+                Self::InvalidV2(e) => write!(f, "v2 authorisation is invalid: {e}"),
             }
         }
     }

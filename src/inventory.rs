@@ -25,7 +25,9 @@ pub struct InstallationIdentity {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `Default` exists so a consumer builds one with `..Default::default()` and
+/// a later additive field is not a compile break at every literal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationOwnership {
     pub application_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -39,22 +41,13 @@ pub struct ApplicationOwnership {
     pub overrides_digest: Option<String>,
     /// The version (or digest) of each owned resource, keyed by the id in
     /// `owned_resources` — what an application-scoped rollback restores.
+    /// Every key must also appear in `owned_resources`; the restoring side
+    /// (PDS3) refuses a version for a resource the application does not own,
+    /// so a rollback can never restore someone else's resource.
     /// Skipped when empty, so a report that carries none is byte-identical
     /// to one written before the field existed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub owned_resource_versions: BTreeMap<String, String>,
-}
-
-impl ApplicationOwnership {
-    /// The first versioned resource that is not in `owned_resources`, if
-    /// any. A version for a resource the application does not own would let
-    /// a rollback restore something that belongs to someone else.
-    pub fn unowned_versioned_resource(&self) -> Option<&str> {
-        self.owned_resource_versions
-            .keys()
-            .find(|id| !self.owned_resources.contains(id))
-            .map(String::as_str)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
