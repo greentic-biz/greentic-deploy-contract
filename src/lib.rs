@@ -34,5 +34,7 @@ pub mod health;
 pub mod inventory;
 pub mod offline;
 pub mod release;
+pub mod revocation;
 #[cfg(feature = "signing")]
 pub mod signed;
+pub mod trust;
