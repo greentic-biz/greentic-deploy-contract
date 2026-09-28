@@ -40,6 +40,7 @@ fn sample() -> RegisterReleaseRequest {
             supported: true,
             notes: None,
         },
+        migrations: Vec::new(),
     }
 }
 
@@ -85,12 +86,16 @@ fn sample_dependencies() -> Vec<DependencyPin> {
             name: "hubspot".into(),
             version_req: Some(">=1.0.0".into()),
             digest: Some(format!("sha256:{}", "d".repeat(64))),
+            shared: false,
+            coexistence: None,
         },
         DependencyPin {
             kind: DependencyKind::Runtime,
             name: "greentic-start".into(),
             version_req: Some(">=1.2.0".into()),
             digest: None,
+            shared: false,
+            coexistence: None,
         },
     ]
 }
@@ -224,4 +229,114 @@ fn request_round_trips_through_json() {
     let back: RegisterReleaseRequest = serde_json::from_str(&s).expect("deserialize");
     assert_eq!(back, sample());
     assert!(s.contains("\"kind\":\"application\""));
+}
+
+/// Captured BEFORE the migration field existed. An absent migration must
+/// leave both the wire JSON and the digest byte-identical.
+#[test]
+fn existing_requests_keep_their_digest_and_bytes() {
+    let mut s = sample();
+    assert_eq!(
+        release_digest(&s).unwrap(),
+        "sha256:08ee234c3285bc4a0bcc128c33cdba1ab284f3f2d2ec4959f34156ed1bcdb6fd"
+    );
+    assert_eq!(
+        serde_json::to_string(&s).unwrap(),
+        r#"{"kind":"application","publisher":"tenant:acme","name":"guest-assistant","version":"2.4.0","artifacts":[{"name":"b.gtpack","version":"2.4.0","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"name":"a.gtpack","version":"2.4.0","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"dependencies":[],"compatibility":{"required_capabilities":["z","a"]},"provenance":{"source_revision":"s1","builder":"designer"},"rollback":{"supported":true}}"#
+    );
+    s.dependencies = sample_dependencies();
+    assert_eq!(
+        release_digest(&s).unwrap(),
+        "sha256:0fd322b1bd97aa10dce17c356148f88fcbb35cda4e0b840c8b4f2303e56796af"
+    );
+    assert_eq!(
+        serde_json::to_string(&s).unwrap(),
+        r#"{"kind":"application","publisher":"tenant:acme","name":"guest-assistant","version":"2.4.0","artifacts":[{"name":"b.gtpack","version":"2.4.0","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"name":"a.gtpack","version":"2.4.0","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"dependencies":[{"kind":"extension","name":"hubspot","version_req":">=1.0.0","digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},{"kind":"runtime","name":"greentic-start","version_req":">=1.2.0"}],"compatibility":{"required_capabilities":["z","a"]},"provenance":{"source_revision":"s1","builder":"designer"},"rollback":{"supported":true}}"#
+    );
+}
+
+#[test]
+fn migrations_enter_the_digest_in_order() {
+    use crate::migration::tests::declaration;
+    let a = sample();
+    let mut b = sample();
+    b.migrations = vec![declaration()];
+    assert_ne!(release_digest(&a).ok(), release_digest(&b).ok());
+    let mut c = b.clone();
+    c.migrations[0].to_schema = "v4".into();
+    assert_ne!(release_digest(&b).ok(), release_digest(&c).ok());
+    let json = serde_json::to_string(&b).unwrap();
+    let back: RegisterReleaseRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, b);
+    assert_eq!(a.validate(), Ok(()));
+    assert_eq!(b.validate(), Ok(()));
+
+    // Two owners: order is part of the digest.
+    let mut other = declaration();
+    other.owner = "app:billing".into();
+    let mut d = sample();
+    d.migrations = vec![declaration(), other.clone()];
+    let mut e = sample();
+    e.migrations = vec![other, declaration()];
+    assert_eq!(d.validate(), Ok(()));
+    assert_ne!(release_digest(&d).ok(), release_digest(&e).ok());
+}
+
+#[test]
+fn a_migration_chain_must_be_continuous_per_owner() {
+    use crate::migration::tests::declaration;
+    let mut next = declaration();
+    next.from_schema = "v3".into();
+    next.to_schema = "v4".into();
+    let mut r = sample();
+    r.migrations = vec![declaration(), next.clone()];
+    assert_eq!(r.validate(), Ok(()));
+    next.from_schema = "v9".into();
+    r.migrations = vec![declaration(), next];
+    assert_eq!(
+        r.validate(),
+        Err(ReleaseRequestError::MigrationChainBroken { index: 1 })
+    );
+    let mut bad = declaration();
+    bad.reversible = false;
+    r.migrations = vec![bad];
+    assert!(matches!(
+        r.validate(),
+        Err(ReleaseRequestError::Migration { index: 0, .. })
+    ));
+}
+
+#[test]
+fn dependency_policy_enters_the_digest_only_when_declared() {
+    let mut a = sample();
+    a.dependencies = sample_dependencies();
+    let mut b = a.clone();
+    b.dependencies[0].shared = true;
+    assert_ne!(release_digest(&a).ok(), release_digest(&b).ok());
+    let mut c = a.clone();
+    c.dependencies[1].coexistence = Some(Coexistence::Exclusive);
+    assert_ne!(release_digest(&a).ok(), release_digest(&c).ok());
+    let mut d = a.clone();
+    d.dependencies[1].coexistence = Some(Coexistence::SideBySide);
+    assert_ne!(release_digest(&c).ok(), release_digest(&d).ok());
+    // Order-independent, like the pins themselves.
+    let mut e = c.clone();
+    e.dependencies.reverse();
+    assert_eq!(release_digest(&c).ok(), release_digest(&e).ok());
+    let json = serde_json::to_value(&c).unwrap();
+    assert_eq!(json["dependencies"][1]["coexistence"], "exclusive");
+    assert!(json["dependencies"][0].get("shared").is_none());
+    let back: RegisterReleaseRequest = serde_json::from_value(json).unwrap();
+    assert_eq!(back, c);
+}
+
+#[test]
+fn dependency_pin_new_has_the_default_policy() {
+    let p = DependencyPin::new(
+        DependencyKind::Runtime,
+        "greentic-start",
+        Some(">=1.2.0".into()),
+    );
+    assert_eq!(p, sample_dependencies()[1]);
+    assert!(p.has_default_policy());
 }

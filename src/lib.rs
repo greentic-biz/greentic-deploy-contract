@@ -35,11 +35,14 @@ pub use types::{DeploymentJob, EnvListItem, EnvOrigin, RunnerStatus};
 /// for good; capping well below that keeps every stream advanceable.
 pub const MAX_SEQUENCE: u64 = (1 << 53) - 1;
 
+pub mod capabilities;
 pub mod dsse;
 pub mod execution;
+pub mod execution_v2;
 pub mod governance;
 pub mod health;
 pub mod inventory;
+pub mod migration;
 pub mod offline;
 pub mod release;
 pub mod revocation;

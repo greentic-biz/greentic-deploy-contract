@@ -29,6 +29,8 @@ fn request() -> RegisterReleaseRequest {
             name: "greentic.llm-openai".into(),
             version_req: Some("^1".into()),
             digest: Some(digest('b')),
+            shared: false,
+            coexistence: None,
         }],
         compatibility: Compatibility::default(),
         provenance: Provenance {
@@ -41,6 +43,7 @@ fn request() -> RegisterReleaseRequest {
             supported: true,
             notes: None,
         },
+        migrations: Vec::new(),
     }
 }
 
@@ -466,3 +469,13 @@ fn the_wire_shape_is_tagged_snake_case() {
 #[cfg(feature = "signing")]
 #[path = "offline_sign_tests.rs"]
 mod signing_tests;
+
+#[test]
+fn an_invalid_migration_declaration_is_refused() {
+    let mut m = sample();
+    let mut decl = crate::migration::tests::declaration();
+    decl.reversible = false;
+    m.releases[0].request.migrations = vec![decl];
+    m.releases[0].release_digest = release_digest(&m.releases[0].request).unwrap();
+    assert!(matches!(m.validate(), Err(OfflineError::BadRequest { .. })));
+}

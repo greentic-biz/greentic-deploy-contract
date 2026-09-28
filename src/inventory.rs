@@ -1,5 +1,7 @@
 //! Installation identity and deployment inventory (design doc §2, §9).
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +25,9 @@ pub struct InstallationIdentity {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `Default` exists so a consumer builds one with `..Default::default()` and
+/// a later additive field is not a compile break at every literal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationOwnership {
     pub application_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,6 +39,15 @@ pub struct ApplicationOwnership {
     /// Digest over the tenant's retained overrides; never the values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides_digest: Option<String>,
+    /// The version (or digest) of each owned resource, keyed by the id in
+    /// `owned_resources` — what an application-scoped rollback restores.
+    /// Every key must also appear in `owned_resources`; the restoring side
+    /// (PDS3) refuses a version for a resource the application does not own,
+    /// so a rollback can never restore someone else's resource.
+    /// Skipped when empty, so a report that carries none is byte-identical
+    /// to one written before the field existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub owned_resource_versions: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,3 +79,7 @@ pub struct DeploymentUnitRecord {
     #[serde(flatten)]
     pub report: UnitReport,
 }
+
+#[cfg(test)]
+#[path = "inventory_tests.rs"]
+mod tests;

@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use crate::migration::{MigrationDeclaration, MigrationError};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseKind {
@@ -50,6 +52,53 @@ pub struct DependencyPin {
     pub version_req: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    /// The dependency is a service other applications in the environment
+    /// also use, so changing it is a coordinated change set rather than this
+    /// release's own business. Skipped when `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared: bool,
+    /// Whether two versions of this dependency can run side by side. `None`
+    /// is "not declared" (planning treats it as unknown, never as
+    /// side-by-side). Skipped when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coexistence: Option<Coexistence>,
+}
+
+/// Whether two versions of a dependency can run at once (design doc §7,
+/// "Packaging and shared dependencies").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coexistence {
+    /// Old and new versions can be installed and serve together.
+    SideBySide,
+    /// Only one version can exist, so every application using it moves
+    /// together.
+    Exclusive,
+}
+
+impl DependencyPin {
+    /// A pin with no digest and the default policy (not shared, coexistence
+    /// undeclared). Set the optional fields on the result.
+    pub fn new(kind: DependencyKind, name: impl Into<String>, version_req: Option<String>) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+            version_req,
+            digest: None,
+            shared: false,
+            coexistence: None,
+        }
+    }
+
+    /// `true` when the pin declares nothing beyond identity — the shape every
+    /// pin had before `shared` / `coexistence` existed.
+    pub fn has_default_policy(&self) -> bool {
+        !self.shared && self.coexistence.is_none()
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +143,57 @@ pub struct RegisterReleaseRequest {
     pub compatibility: Compatibility,
     pub provenance: Provenance,
     pub rollback: RollbackDeclaration,
+    /// The data migrations this release performs, in execution order. Empty,
+    /// it is not serialised and does not enter [`release_digest`], so every
+    /// release registered before the field existed keeps its digest. The
+    /// order is part of the digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub migrations: Vec<MigrationDeclaration>,
+}
+
+/// Why a [`RegisterReleaseRequest`] refuses to validate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReleaseRequestError {
+    /// `migrations[index]` fails its own validation.
+    Migration { index: usize, error: MigrationError },
+    /// `migrations[index]` migrates an owner whose previous declaration in
+    /// the list ended at a different schema than this one starts from.
+    MigrationChainBroken { index: usize },
+}
+
+impl std::fmt::Display for ReleaseRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Migration { index, error } => write!(f, "migrations[{index}]: {error}"),
+            Self::MigrationChainBroken { index } => write!(
+                f,
+                "migrations[{index}] does not start where the owner's previous migration ended"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReleaseRequestError {}
+
+impl RegisterReleaseRequest {
+    /// Refuse a request whose declarations contradict themselves. Every
+    /// registration path (the admin's catalogue, the designer's
+    /// `release_register`, offline import) must call this BEFORE computing
+    /// or trusting [`release_digest`], which digests whatever it is given.
+    pub fn validate(&self) -> Result<(), ReleaseRequestError> {
+        let mut last_to: std::collections::BTreeMap<&str, &str> = Default::default();
+        for (index, m) in self.migrations.iter().enumerate() {
+            m.validate()
+                .map_err(|error| ReleaseRequestError::Migration { index, error })?;
+            if let Some(prev) = last_to.insert(&m.owner, &m.to_schema)
+                && prev != m.from_schema
+            {
+                return Err(ReleaseRequestError::MigrationChainBroken { index });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +205,15 @@ pub struct ReleaseRecord {
     #[serde(flatten)]
     pub request: RegisterReleaseRequest,
 }
+
+type DependencyPolicy<'a> = (
+    DependencyKind,
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    bool,
+    Option<Coexistence>,
+);
 
 /// The content that names a release. Provenance and artifact `source` are
 /// deliberately excluded: a rebuild of identical bytes, or the same bytes
@@ -121,6 +230,13 @@ struct Canonical<'a> {
     abi: Option<&'a str>,
     required_capabilities: Vec<&'a str>,
     rollback_supported: bool,
+    /// `(kind, name, version_req, digest, shared, coexistence)` for pins that
+    /// declare a policy; skipped when none does, so older digests do not move.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dependency_policies: Vec<DependencyPolicy<'a>>,
+    /// Skipped when empty, so pre-migration digests do not move.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    migrations: &'a [MigrationDeclaration],
 }
 
 pub fn release_digest(req: &RegisterReleaseRequest) -> Result<String, serde_json::Error> {
@@ -150,6 +266,22 @@ pub fn release_digest(req: &RegisterReleaseRequest) -> Result<String, serde_json
         })
         .collect();
     dependencies.sort();
+    let mut dependency_policies: Vec<DependencyPolicy<'_>> = req
+        .dependencies
+        .iter()
+        .filter(|d| !d.has_default_policy())
+        .map(|d| {
+            (
+                d.kind,
+                d.name.as_str(),
+                d.version_req.as_deref(),
+                d.digest.as_deref(),
+                d.shared,
+                d.coexistence,
+            )
+        })
+        .collect();
+    dependency_policies.sort();
     let mut required_capabilities: Vec<&str> = req
         .compatibility
         .required_capabilities
@@ -169,6 +301,8 @@ pub fn release_digest(req: &RegisterReleaseRequest) -> Result<String, serde_json
         abi: req.compatibility.abi.as_deref(),
         required_capabilities,
         rollback_supported: req.rollback.supported,
+        dependency_policies,
+        migrations: &req.migrations,
     };
     let bytes = serde_json::to_vec(&canonical)?;
     Ok(format!("sha256:{}", hex_lower(&Sha256::digest(&bytes))))
