@@ -14,6 +14,11 @@
 //! from a key in `trusted`, whatever `keyid` the envelope claims — `keyid` is
 //! advisory, and a key named by the envelope itself establishes nothing. An
 //! empty `trusted` list accepts nothing.
+//!
+//! [`sign_bytes`] / [`verify_bytes`] are the payload-agnostic core: any
+//! schema can be signed by several keys and verified k-of-n without this
+//! module knowing its shape. [`sign`] / [`verify`] are the execution
+//! authorisation wrappers over them (one key, threshold 1).
 
 use serde::{Deserialize, Serialize};
 
@@ -106,11 +111,17 @@ mod signing {
         WrongPayloadType,
         /// `payload` is not valid standard base64.
         BadEncoding,
+        /// [`verify_bytes`] was asked for a threshold of 0. Refused rather
+        /// than read as "accept anything".
+        ZeroThreshold,
         /// The envelope carries more than [`MAX_SIGNATURES`] signatures.
         TooManySignatures,
         /// No signature verifies under any trusted key (including: no
         /// trusted key configured, or no signatures at all).
         NoTrustedSignature,
+        /// Some trusted keys signed, but fewer DISTINCT ones than the
+        /// threshold asked for.
+        BelowThreshold { required: usize, found: usize },
         /// The signed bytes are not a v1 authorisation (malformed JSON, an
         /// unknown field, an unknown operation).
         BadPayload(serde_json::Error),
@@ -123,6 +134,11 @@ mod signing {
             match self {
                 Self::WrongPayloadType => f.write_str("wrong DSSE payload type"),
                 Self::BadEncoding => f.write_str("payload is not valid base64"),
+                Self::ZeroThreshold => f.write_str("a signature threshold of 0 is refused"),
+                Self::BelowThreshold { required, found } => write!(
+                    f,
+                    "{found} distinct trusted key(s) signed, {required} required"
+                ),
                 Self::TooManySignatures => {
                     write!(f, "envelope carries more than {MAX_SIGNATURES} signatures")
                 }
@@ -192,15 +208,11 @@ mod signing {
     ) -> Result<DsseEnvelope, SignError> {
         auth.validate().map_err(SignError::Invalid)?;
         let payload = serde_json::to_vec(auth).map_err(SignError::Serialize)?;
-        let signature = key.sign(&pae(EXECUTION_AUTHORISATION_PAYLOAD_TYPE, &payload));
-        Ok(DsseEnvelope {
-            payload_type: EXECUTION_AUTHORISATION_PAYLOAD_TYPE.to_string(),
-            payload: STANDARD.encode(&payload),
-            signatures: vec![DsseSignature {
-                keyid: key_id(&key.verifying_key()),
-                sig: STANDARD.encode(signature.to_bytes()),
-            }],
-        })
+        Ok(sign_bytes(
+            EXECUTION_AUTHORISATION_PAYLOAD_TYPE,
+            &payload,
+            &[key],
+        ))
     }
 
     /// Verify `env` against `trusted`, then parse and validate. See the
@@ -210,7 +222,58 @@ mod signing {
         env: &DsseEnvelope,
         trusted: &[VerifyingKey],
     ) -> Result<ExecutionAuthorisation, VerifyError> {
-        if env.payload_type != EXECUTION_AUTHORISATION_PAYLOAD_TYPE {
+        let verified = verify_bytes(env, EXECUTION_AUTHORISATION_PAYLOAD_TYPE, trusted, 1)?;
+        let auth: ExecutionAuthorisation =
+            serde_json::from_slice(&verified.payload).map_err(VerifyError::BadPayload)?;
+        auth.validate().map_err(VerifyError::Invalid)?;
+        Ok(auth)
+    }
+
+    /// The outcome of a successful [`verify_bytes`]: the exact signed bytes,
+    /// and the [`key_id`] of every distinct trusted key that signed them, in
+    /// `trusted` order.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Verified {
+        pub payload: Vec<u8>,
+        pub signer_key_ids: Vec<String>,
+    }
+
+    /// Sign `payload` as `payload_type` with every key in `keys`, one
+    /// signature each, in order. Nothing about the payload is checked: a
+    /// typed caller validates before it gets here.
+    pub fn sign_bytes(payload_type: &str, payload: &[u8], keys: &[&SigningKey]) -> DsseEnvelope {
+        let message = pae(payload_type, payload);
+        DsseEnvelope {
+            payload_type: payload_type.to_string(),
+            payload: STANDARD.encode(payload),
+            signatures: keys
+                .iter()
+                .map(|key| DsseSignature {
+                    keyid: key_id(&key.verifying_key()),
+                    sig: STANDARD.encode(key.sign(&message).to_bytes()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Verify that at least `threshold` DISTINCT keys from `trusted` signed
+    /// `env`, and that it is of `expected_type`. Signatures are checked over
+    /// the PAE of the decoded bytes; the payload is never parsed here.
+    ///
+    /// `keyid` is advisory: each signature is tried against every trusted
+    /// key. A key that signed twice counts once, and a key listed twice in
+    /// `trusted` counts once. `threshold == 0` is an error, never "accept
+    /// anything"; an empty `trusted` accepts nothing.
+    pub fn verify_bytes(
+        env: &DsseEnvelope,
+        expected_type: &str,
+        trusted: &[VerifyingKey],
+        threshold: usize,
+    ) -> Result<Verified, VerifyError> {
+        if threshold == 0 {
+            return Err(VerifyError::ZeroThreshold);
+        }
+        if env.payload_type != expected_type {
             return Err(VerifyError::WrongPayloadType);
         }
         let payload = STANDARD
@@ -220,26 +283,37 @@ mod signing {
             return Err(VerifyError::TooManySignatures);
         }
         let message = pae(&env.payload_type, &payload);
-        let signed_by_trusted = env.signatures.iter().any(|s| {
-            // A malformed signature is simply not a trusted one; it must not
-            // stop a valid signature beside it from counting.
-            let Ok(bytes) = STANDARD.decode(s.sig.as_bytes()) else {
-                return false;
-            };
-            let Ok(sig) = Signature::from_slice(&bytes) else {
-                return false;
-            };
-            trusted
+        // A malformed signature is simply not a trusted one; it must not
+        // stop a valid signature beside it from counting.
+        let signatures: Vec<Signature> = env
+            .signatures
+            .iter()
+            .filter_map(|s| STANDARD.decode(s.sig.as_bytes()).ok())
+            .filter_map(|bytes| Signature::from_slice(&bytes).ok())
+            .collect();
+        let mut signers: Vec<&VerifyingKey> = Vec::new();
+        for key in trusted {
+            if signers.contains(&key) {
+                continue;
+            }
+            if signatures
                 .iter()
-                .any(|k| k.verify_strict(&message, &sig).is_ok())
-        });
-        if !signed_by_trusted {
-            return Err(VerifyError::NoTrustedSignature);
+                .any(|sig| key.verify_strict(&message, sig).is_ok())
+            {
+                signers.push(key);
+            }
         }
-        let auth: ExecutionAuthorisation =
-            serde_json::from_slice(&payload).map_err(VerifyError::BadPayload)?;
-        auth.validate().map_err(VerifyError::Invalid)?;
-        Ok(auth)
+        match signers.len() {
+            0 => Err(VerifyError::NoTrustedSignature),
+            found if found < threshold => Err(VerifyError::BelowThreshold {
+                required: threshold,
+                found,
+            }),
+            _ => Ok(Verified {
+                payload,
+                signer_key_ids: signers.into_iter().map(key_id).collect(),
+            }),
+        }
     }
 
     /// Parse a comma-separated `ed25519:<std base64 of 32 bytes>` list, the
@@ -277,3 +351,7 @@ mod signing {
 #[cfg(test)]
 #[path = "dsse_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "signing"))]
+#[path = "dsse_bytes_tests.rs"]
+mod bytes_tests;
