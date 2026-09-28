@@ -198,6 +198,21 @@ fn check_digest(value: &str, field: &'static str) -> Result<(), ValidationError>
     }
 }
 
+/// Non-empty and free of leading/trailing whitespace — the identifier rule
+/// every signed schema in this crate applies.
+pub(crate) fn is_clean_identifier(s: &str) -> bool {
+    !s.trim().is_empty() && s.trim() == s
+}
+
+/// A stable snake_case code: non-empty, `[a-z0-9_]`, at most
+/// [`MAX_CHECKPOINT_REASON_BYTES`].
+pub(crate) fn is_reason_code(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_CHECKPOINT_REASON_BYTES
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
 fn check_non_empty(value: &str, field: &'static str) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
         Err(ValidationError::EmptyField(field))
@@ -391,15 +406,10 @@ impl ExecutionCheckpoint {
         if self.traffic_percent.is_some_and(|p| p > 100) {
             return Err(CheckpointError::TrafficPercentOutOfRange);
         }
-        if let Some(reason) = &self.reason {
-            let code = !reason.is_empty()
-                && reason.len() <= MAX_CHECKPOINT_REASON_BYTES
-                && reason
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-            if !code {
-                return Err(CheckpointError::BadReason);
-            }
+        if let Some(reason) = &self.reason
+            && !is_reason_code(reason)
+        {
+            return Err(CheckpointError::BadReason);
         }
         if self
             .detail

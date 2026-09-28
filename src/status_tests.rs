@@ -1,0 +1,278 @@
+use super::*;
+use crate::execution::tests::digest;
+use chrono::TimeZone;
+use serde_json::json;
+
+fn ts(hour: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 9, 28, hour, 0, 0).unwrap()
+}
+
+fn entry() -> StatusEntry {
+    StatusEntry {
+        rollout_id: "ro-1".into(),
+        authorisation_id: Some("auth-1".into()),
+        release_digest: digest('a'),
+        environment_id: "prod".into(),
+        unit_id: "env:bundle-a".into(),
+        state: ExecState::Healthy,
+        reason: None,
+        recorded_at: ts(10),
+    }
+}
+
+fn sample() -> StatusReport {
+    StatusReport {
+        schema: STATUS_REPORT_SCHEMA.into(),
+        installation_id: "inst-1".into(),
+        report_id: "rep-1".into(),
+        sequence: 1,
+        observed_at: ts(11),
+        entries: vec![entry()],
+    }
+}
+
+#[test]
+fn a_well_formed_report_validates() {
+    assert_eq!(sample().validate(), Ok(()));
+}
+
+#[test]
+fn an_empty_report_is_valid() {
+    let mut r = sample();
+    r.entries.clear();
+    assert_eq!(r.validate(), Ok(()));
+}
+
+#[test]
+fn report_level_refusals() {
+    let mut r = sample();
+    r.schema = "greentic.status-report.v2".into();
+    assert!(matches!(r.validate(), Err(StatusError::UnknownSchema(_))));
+    let mut r = sample();
+    r.sequence = 0;
+    assert_eq!(r.validate(), Err(StatusError::BadSequence));
+    r.sequence = crate::MAX_SEQUENCE + 1;
+    assert_eq!(r.validate(), Err(StatusError::BadSequence));
+    let mut r = sample();
+    r.installation_id = "".into();
+    assert_eq!(
+        r.validate(),
+        Err(StatusError::BadIdentifier("installation_id"))
+    );
+    let mut r = sample();
+    r.report_id = "rep-1 ".into();
+    assert_eq!(r.validate(), Err(StatusError::BadIdentifier("report_id")));
+}
+
+fn nth_entry(i: usize) -> StatusEntry {
+    let mut e = entry();
+    e.unit_id = format!("unit-{i}");
+    e
+}
+
+#[test]
+fn the_entry_cap_is_inclusive() {
+    let mut r = sample();
+    r.entries = (0..MAX_STATUS_ENTRIES).map(nth_entry).collect();
+    assert_eq!(r.validate(), Ok(()));
+    r.entries.push(nth_entry(MAX_STATUS_ENTRIES));
+    assert_eq!(r.validate(), Err(StatusError::TooManyEntries));
+}
+
+#[test]
+fn duplicate_entries_for_one_unit_are_refused() {
+    let mut r = sample();
+    r.entries.push(entry());
+    assert_eq!(r.validate(), Err(StatusError::DuplicateEntry));
+    // Same unit in another environment is a different entry.
+    r.entries[1].environment_id = "staging".into();
+    assert_eq!(r.validate(), Ok(()));
+}
+
+#[test]
+fn identifiers_are_bounded_printable_ascii() {
+    for bad in [
+        "a b".to_string(),
+        "a\nb".into(),
+        "é".into(),
+        "x".repeat(257),
+    ] {
+        let mut r = sample();
+        r.entries[0].unit_id = bad;
+        assert_eq!(r.validate(), Err(StatusError::BadIdentifier("unit_id")));
+    }
+    let mut r = sample();
+    r.entries[0].unit_id = "x".repeat(MAX_STATUS_ID_BYTES);
+    assert_eq!(r.validate(), Ok(()));
+}
+
+#[test]
+fn admit_checks_installation_replay_and_future() {
+    let r = sample();
+    let skew = Duration::minutes(5);
+    assert_eq!(r.admit("inst-1", 0, ts(11), skew), Ok(()));
+    assert_eq!(
+        r.admit("inst-2", 0, ts(11), skew),
+        Err(StatusAdmitError::WrongInstallation)
+    );
+    assert!(matches!(
+        r.admit("inst-1", 1, ts(11), skew),
+        Err(StatusAdmitError::Replayed { .. })
+    ));
+    assert_eq!(
+        r.admit("inst-1", 0, ts(10), skew),
+        Err(StatusAdmitError::ObservedInFuture)
+    );
+    assert_eq!(
+        r.admit("inst-1", 0, ts(11) - Duration::minutes(3), skew),
+        Ok(())
+    );
+}
+
+#[test]
+fn entry_level_refusals() {
+    type Case = (fn(&mut StatusEntry), StatusError);
+    let cases: Vec<Case> = vec![
+        (
+            |e| e.release_digest = "sha256:ABC".into(),
+            StatusError::BadDigest,
+        ),
+        (
+            |e| e.rollout_id = " ".into(),
+            StatusError::BadIdentifier("rollout_id"),
+        ),
+        (
+            |e| e.authorisation_id = Some("".into()),
+            StatusError::BadIdentifier("authorisation_id"),
+        ),
+        (
+            |e| e.environment_id = "".into(),
+            StatusError::BadIdentifier("environment_id"),
+        ),
+        (
+            |e| e.unit_id = "".into(),
+            StatusError::BadIdentifier("unit_id"),
+        ),
+        (
+            |e| e.reason = Some("Not A Code".into()),
+            StatusError::BadReason,
+        ),
+        (
+            |e| e.recorded_at = ts(12),
+            StatusError::RecordedAfterObservation,
+        ),
+    ];
+    for (mutate, expected) in cases {
+        let mut r = sample();
+        mutate(&mut r.entries[0]);
+        assert_eq!(r.validate(), Err(expected));
+    }
+}
+
+#[test]
+fn a_reason_code_and_no_authorisation_are_fine() {
+    let mut r = sample();
+    r.entries[0].authorisation_id = None;
+    r.entries[0].state = ExecState::Rejected;
+    r.entries[0].reason = Some("baseline_changed".into());
+    assert_eq!(r.validate(), Ok(()));
+}
+
+#[test]
+fn no_free_form_field_is_accepted() {
+    let mut v = serde_json::to_value(sample()).unwrap();
+    assert_eq!(v["entries"][0]["state"], "healthy");
+    v["entries"][0]["detail"] = json!("secret stuff");
+    assert!(serde_json::from_value::<StatusReport>(v).is_err());
+    let mut v = serde_json::to_value(sample()).unwrap();
+    v["health"] = json!({});
+    assert!(serde_json::from_value::<StatusReport>(v).is_err());
+    let mut v = serde_json::to_value(sample()).unwrap();
+    v["entries"][0]["state"] = json!("mostly_fine");
+    assert!(serde_json::from_value::<StatusReport>(v).is_err());
+}
+
+#[cfg(feature = "signing")]
+mod signing_tests {
+    use super::*;
+    use crate::dsse::{VerifyError, key_id};
+    use crate::revocation::{REVOCATION_SCHEMA, RevocationList};
+    use crate::signed::{OpenError, SignError};
+    use crate::trust::{TrustDomain, TrustSet};
+    use base64::Engine;
+    use ed25519_dalek::SigningKey;
+
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn status_keys(seed: u8) -> TrustSet {
+        TrustSet::new(TrustDomain::StatusReport, vec![key(seed).verifying_key()])
+    }
+
+    #[test]
+    fn round_trip() {
+        let k = key(4);
+        let env = sign_status(&sample(), &[&k]).unwrap();
+        assert_eq!(env.payload_type, STATUS_REPORT_PAYLOAD_TYPE);
+        let opened = verify_status(&env, &status_keys(4), 1, None).unwrap();
+        assert_eq!(opened.value, sample());
+        assert_eq!(opened.signer_key_ids, vec![key_id(&k.verifying_key())]);
+    }
+
+    #[test]
+    fn another_installations_key_or_domain_is_refused() {
+        let env = sign_status(&sample(), &[&key(4)]).unwrap();
+        assert!(matches!(
+            verify_status(&env, &status_keys(5), 1, None),
+            Err(OpenError::Signature(VerifyError::NoTrustedSignature))
+        ));
+        let exec = TrustSet::new(TrustDomain::Execution, vec![key(4).verifying_key()]);
+        assert!(matches!(
+            verify_status(&env, &exec, 1, None),
+            Err(OpenError::WrongTrustDomain { .. })
+        ));
+    }
+
+    #[test]
+    fn a_revoked_status_key_is_refused() {
+        let env = sign_status(&sample(), &[&key(4)]).unwrap();
+        let list = RevocationList {
+            schema: REVOCATION_SCHEMA.into(),
+            issuer: "greentic".into(),
+            sequence: 1,
+            issued_at: ts(9),
+            valid_until: ts(23),
+            revoked_key_ids: vec![key_id(&key(4).verifying_key())],
+            revoked_release_digests: vec![],
+        };
+        assert!(matches!(
+            verify_status(&env, &status_keys(4), 1, Some(&list)),
+            Err(OpenError::RevokedSigner(_))
+        ));
+    }
+
+    #[test]
+    fn an_invalid_report_is_never_signed() {
+        let mut r = sample();
+        r.sequence = 0;
+        assert!(matches!(
+            sign_status(&r, &[&key(4)]),
+            Err(SignError::Invalid(StatusError::BadSequence))
+        ));
+    }
+
+    #[test]
+    fn a_tampered_payload_is_refused() {
+        let k = key(4);
+        let mut env = sign_status(&sample(), &[&k]).unwrap();
+        let mut r = sample();
+        r.entries[0].state = ExecState::RolledBack;
+        env.payload =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&r).unwrap());
+        assert!(matches!(
+            verify_status(&env, &status_keys(4), 1, None),
+            Err(OpenError::Signature(VerifyError::NoTrustedSignature))
+        ));
+    }
+}

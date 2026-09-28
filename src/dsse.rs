@@ -73,7 +73,8 @@ mod signing {
 
     /// The most signatures [`verify`] will look at. Each one costs up to
     /// `trusted.len()` Ed25519 verifications, so an envelope carrying more is
-    /// refused outright rather than verified.
+    /// refused outright rather than verified. It also bounds every threshold:
+    /// one above it is `VerifyError::ThresholdUnreachable`.
     pub const MAX_SIGNATURES: usize = 8;
 
     /// Why [`sign`] refused to sign.
@@ -105,7 +106,16 @@ mod signing {
 
     /// Why [`verify`] refused an envelope. Each is a distinct outcome so a
     /// receiver can report a distinct reason code.
+    ///
+    /// `#[non_exhaustive]` because this enum grew twice already (C1 added
+    /// `ZeroThreshold` and `BelowThreshold`) and every new signed schema may
+    /// add a refusal of its own. A consumer's exhaustive `match` turned each
+    /// of those additions into a compile break in a crate that did not care
+    /// about the new case; a consumer must now carry a wildcard arm, which
+    /// should map to a generic "signature refused" code rather than to
+    /// acceptance.
     #[derive(Debug)]
+    #[non_exhaustive]
     pub enum VerifyError {
         /// `payloadType` is not the v1 execution-authorisation type.
         WrongPayloadType,
@@ -116,6 +126,10 @@ mod signing {
         ZeroThreshold,
         /// The envelope carries more than [`MAX_SIGNATURES`] signatures.
         TooManySignatures,
+        /// The threshold asked for exceeds [`MAX_SIGNATURES`], so no envelope
+        /// this crate accepts could ever meet it. Refused as a configuration
+        /// error rather than reported as a missing signature.
+        ThresholdUnreachable { threshold: usize },
         /// No signature verifies under any trusted key (including: no
         /// trusted key configured, or no signatures at all).
         NoTrustedSignature,
@@ -138,6 +152,10 @@ mod signing {
                 Self::BelowThreshold { required, found } => write!(
                     f,
                     "{found} distinct trusted key(s) signed, {required} required"
+                ),
+                Self::ThresholdUnreachable { threshold } => write!(
+                    f,
+                    "a threshold of {threshold} exceeds the {MAX_SIGNATURES} signatures an envelope may carry"
                 ),
                 Self::TooManySignatures => {
                     write!(f, "envelope carries more than {MAX_SIGNATURES} signatures")
@@ -270,8 +288,27 @@ mod signing {
         trusted: &[VerifyingKey],
         threshold: usize,
     ) -> Result<Verified, VerifyError> {
+        verify_signer_keys(env, expected_type, trusted, threshold).map(|(payload, signers)| {
+            Verified {
+                payload,
+                signer_key_ids: signers.iter().map(key_id).collect(),
+            }
+        })
+    }
+
+    /// [`verify_bytes`], returning the signing KEYS themselves rather than
+    /// their truncated ids, for callers that compare signers against a set.
+    pub(crate) fn verify_signer_keys(
+        env: &DsseEnvelope,
+        expected_type: &str,
+        trusted: &[VerifyingKey],
+        threshold: usize,
+    ) -> Result<(Vec<u8>, Vec<VerifyingKey>), VerifyError> {
         if threshold == 0 {
             return Err(VerifyError::ZeroThreshold);
+        }
+        if threshold > MAX_SIGNATURES {
+            return Err(VerifyError::ThresholdUnreachable { threshold });
         }
         if env.payload_type != expected_type {
             return Err(VerifyError::WrongPayloadType);
@@ -309,10 +346,7 @@ mod signing {
                 required: threshold,
                 found,
             }),
-            _ => Ok(Verified {
-                payload,
-                signer_key_ids: signers.into_iter().map(key_id).collect(),
-            }),
+            _ => Ok((payload, signers.into_iter().copied().collect())),
         }
     }
 

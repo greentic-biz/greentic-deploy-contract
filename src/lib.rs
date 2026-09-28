@@ -12,6 +12,11 @@
 //! live here so the admin (signer) and the designer (verifier) cannot
 //! disagree about the bytes a signature covers. Without the feature, the
 //! envelope type and [`dsse::pae`] are still available.
+//!
+//! The same feature adds the typed `sign_*` / `verify_*` pairs of the other
+//! signed schemas (offline release envelope, trust rotation, revocation list,
+//! status report), all built on the generic core through the `signed` module. Their
+//! types and `validate()` need no feature.
 #![forbid(unsafe_code)]
 
 mod enums;
@@ -22,9 +27,23 @@ pub use enums::{DeployTarget, EnvStatus, JobStatus};
 pub use timestamp::parse_lenient;
 pub use types::{DeploymentJob, EnvListItem, EnvOrigin, RunnerStatus};
 
+/// The largest `sequence` any signed stream in this crate accepts (trust
+/// rotations, revocation lists, status reports): 2^53 - 1, the largest
+/// integer every JSON consumer reads exactly. A stream that reached
+/// `u64::MAX` could never advance again (`sequence > last` is then
+/// unsatisfiable), so one buggy or compromised statement would freeze it
+/// for good; capping well below that keeps every stream advanceable.
+pub const MAX_SEQUENCE: u64 = (1 << 53) - 1;
+
 pub mod dsse;
 pub mod execution;
 pub mod governance;
 pub mod health;
 pub mod inventory;
+pub mod offline;
 pub mod release;
+pub mod revocation;
+#[cfg(feature = "signing")]
+pub mod signed;
+pub mod status;
+pub mod trust;
