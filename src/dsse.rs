@@ -117,7 +117,8 @@ mod signing {
     #[derive(Debug)]
     #[non_exhaustive]
     pub enum VerifyError {
-        /// `payloadType` is not the v1 execution-authorisation type.
+        /// `payloadType` is not the type the verifier expects (or, for
+        /// `execution_v2::verify_any`, neither execution-authorisation type).
         WrongPayloadType,
         /// `payload` is not valid standard base64.
         BadEncoding,
@@ -141,6 +142,9 @@ mod signing {
         BadPayload(serde_json::Error),
         /// The authorisation parsed but fails [`ExecutionAuthorisation::validate`].
         Invalid(ValidationError),
+        /// A v2 authorisation parsed but fails
+        /// [`ExecutionAuthorisationV2::validate`](crate::execution_v2::ExecutionAuthorisationV2::validate).
+        InvalidV2(crate::execution_v2::ValidationErrorV2),
     }
 
     impl std::fmt::Display for VerifyError {
@@ -163,6 +167,7 @@ mod signing {
                 Self::NoTrustedSignature => f.write_str("no signature from a trusted key"),
                 Self::BadPayload(e) => write!(f, "payload is not a v1 authorisation: {e}"),
                 Self::Invalid(e) => write!(f, "authorisation is invalid: {e}"),
+                Self::InvalidV2(e) => write!(f, "authorisation is invalid: {e}"),
             }
         }
     }
@@ -172,6 +177,7 @@ mod signing {
             match self {
                 Self::BadPayload(e) => Some(e),
                 Self::Invalid(e) => Some(e),
+                Self::InvalidV2(e) => Some(e),
                 _ => None,
             }
         }

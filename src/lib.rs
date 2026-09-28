@@ -37,6 +37,7 @@ pub const MAX_SEQUENCE: u64 = (1 << 53) - 1;
 
 pub mod dsse;
 pub mod execution;
+pub mod execution_v2;
 pub mod governance;
 pub mod health;
 pub mod inventory;

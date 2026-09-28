@@ -263,41 +263,74 @@ impl ExecutionAuthorisation {
     /// ADMISSION (`not_before <= now < expires_at`) is the receiver's check,
     /// since this crate reads no clock; this only checks the window's shape.
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.schema != EXECUTION_AUTHORISATION_SCHEMA {
-            return Err(ValidationError::UnknownSchema(self.schema.clone()));
-        }
-        check_non_empty(&self.authorisation_id, "authorisation_id")?;
-        check_non_empty(&self.installation_id, "installation_id")?;
-        check_non_empty(&self.tenant_id, "tenant_id")?;
-        check_non_empty(&self.environment_id, "environment_id")?;
-        check_non_empty(&self.rollout_id, "rollout_id")?;
-        check_non_empty(&self.release_id, "release_id")?;
-        check_digest(&self.release_digest, "release_digest")?;
-        if self.units.is_empty() {
-            return Err(ValidationError::NoUnits);
-        }
-        let mut seen = BTreeSet::new();
-        for unit in &self.units {
-            check_non_empty(&unit.unit_id, "unit_id")?;
-            if !seen.insert(unit.unit_id.as_str()) {
-                return Err(ValidationError::DuplicateUnit(unit.unit_id.clone()));
-            }
-            unit.expected_baseline.validate()?;
-            unit.target.validate()?;
-            // An update's target IS the release artifact; a rollback's target
-            // may legitimately be "not previously deployed" (`None`).
-            if self.operation == ExecOperation::Update && unit.target.bundle_digest.is_none() {
-                return Err(ValidationError::MissingTargetDigest(unit.unit_id.clone()));
-            }
-        }
-        if self.expires_at <= self.not_before {
-            return Err(ValidationError::WindowInverted);
-        }
-        if self.expires_at - self.not_before > MAX_VALIDITY {
-            return Err(ValidationError::WindowTooLong);
-        }
-        self.traffic.validate()
+        validate_common(&CommonFields {
+            expected_schema: EXECUTION_AUTHORISATION_SCHEMA,
+            schema: &self.schema,
+            ids: [
+                (&self.authorisation_id, "authorisation_id"),
+                (&self.installation_id, "installation_id"),
+                (&self.tenant_id, "tenant_id"),
+                (&self.environment_id, "environment_id"),
+                (&self.rollout_id, "rollout_id"),
+                (&self.release_id, "release_id"),
+            ],
+            release_digest: &self.release_digest,
+            units: &self.units,
+            require_target_digest: self.operation == ExecOperation::Update,
+            not_before: self.not_before,
+            expires_at: self.expires_at,
+            traffic: &self.traffic,
+        })
     }
+}
+
+/// The fields every execution-authorisation schema version shares, borrowed
+/// so v1 and v2 validate them through ONE function in ONE order.
+pub(crate) struct CommonFields<'a> {
+    pub(crate) expected_schema: &'static str,
+    pub(crate) schema: &'a str,
+    pub(crate) ids: [(&'a str, &'static str); 6],
+    pub(crate) release_digest: &'a str,
+    pub(crate) units: &'a [UnitTarget],
+    /// Every unit must carry a `target.bundle_digest` (an update).
+    pub(crate) require_target_digest: bool,
+    pub(crate) not_before: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) traffic: &'a TrafficPolicy,
+}
+
+pub(crate) fn validate_common(c: &CommonFields<'_>) -> Result<(), ValidationError> {
+    if c.schema != c.expected_schema {
+        return Err(ValidationError::UnknownSchema(c.schema.to_string()));
+    }
+    for (value, field) in c.ids {
+        check_non_empty(value, field)?;
+    }
+    check_digest(c.release_digest, "release_digest")?;
+    if c.units.is_empty() {
+        return Err(ValidationError::NoUnits);
+    }
+    let mut seen = BTreeSet::new();
+    for unit in c.units {
+        check_non_empty(&unit.unit_id, "unit_id")?;
+        if !seen.insert(unit.unit_id.as_str()) {
+            return Err(ValidationError::DuplicateUnit(unit.unit_id.clone()));
+        }
+        unit.expected_baseline.validate()?;
+        unit.target.validate()?;
+        // An update's target IS the release artifact; a rollback's target
+        // may legitimately be "not previously deployed" (`None`).
+        if c.require_target_digest && unit.target.bundle_digest.is_none() {
+            return Err(ValidationError::MissingTargetDigest(unit.unit_id.clone()));
+        }
+    }
+    if c.expires_at <= c.not_before {
+        return Err(ValidationError::WindowInverted);
+    }
+    if c.expires_at - c.not_before > MAX_VALIDITY {
+        return Err(ValidationError::WindowTooLong);
+    }
+    c.traffic.validate()
 }
 
 /// Where one unit's execution stands. Journalled by the designer; the admin
