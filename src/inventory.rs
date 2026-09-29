@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::capabilities::AdapterCapabilities;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Connectivity {
@@ -50,7 +52,9 @@ pub struct ApplicationOwnership {
     pub owned_resource_versions: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `Default` exists for the same reason as on [`ApplicationOwnership`]: a
+/// later additive field must not be a compile break at every literal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitReport {
     pub adapter: String,
     #[serde(default)]
@@ -67,6 +71,17 @@ pub struct UnitReport {
     pub applications: Vec<ApplicationOwnership>,
     /// `0` creates; otherwise must equal the stored generation.
     pub expected_generation: u64,
+    /// What the unit's deployment adapter reported it can do, read from the
+    /// deployer at report time (`op env capabilities`).
+    ///
+    /// `None` means NOT REPORTED — the reporter predates the field, or its
+    /// deployer could not answer — and is not the same as "can do nothing":
+    /// a consumer falls back to whatever it knew before. `Some` is the
+    /// adapter's own statement and is authoritative for this unit until the
+    /// next report. Skipped when `None`, so a report that carries none is
+    /// byte-identical to one written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<AdapterCapabilities>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
