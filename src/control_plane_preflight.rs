@@ -34,9 +34,12 @@ pub struct ObservedComponent {
     pub db_schema_head: Option<i64>,
 }
 
+#[derive(Debug)]
 pub struct PreflightInput<'a> {
     pub manifest: &'a ControlPlaneManifest,
     pub observed: &'a [ObservedComponent],
+    /// A component absent from this map is treated as
+    /// [`ImagePresence::Unknown`] (a warning, never a blocker).
     pub presence: &'a BTreeMap<Component, ImagePresence>,
     /// OCI platforms of the nodes the chart schedules onto (`linux/amd64`).
     pub node_platforms: &'a [String],
@@ -142,13 +145,17 @@ pub fn preflight(i: &PreflightInput<'_>) -> Preflight {
 
     for img in &i.manifest.components {
         let c = img.component;
-        match i.presence.get(&c).unwrap_or(&ImagePresence::Unknown) {
+        let presence = i.presence.get(&c).unwrap_or(&ImagePresence::Unknown);
+        match presence {
             ImagePresence::Present { .. } => {}
             ImagePresence::Absent => blockers.push(Blocker::ImageAbsent { component: c }),
             ImagePresence::Unknown => warnings.push(Warning::ImagePresenceUnknown { component: c }),
         }
+        let only_platform = single_platform_present(img, presence);
         for p in i.node_platforms {
-            if !img.platform_digests.contains_key(p) {
+            let available = img.platform_digests.contains_key(p)
+                && only_platform.is_none_or(|only| only == p.as_str());
+            if !available {
                 blockers.push(Blocker::PlatformUnavailable {
                     component: c,
                     platform: p.clone(),
@@ -161,8 +168,8 @@ pub fn preflight(i: &PreflightInput<'_>) -> Preflight {
             continue;
         };
         match (
-            semver::Version::parse(&o.app_version),
-            semver::Version::parse(&img.app_version),
+            parse_ignoring_build(&o.app_version),
+            parse_ignoring_build(&img.app_version),
         ) {
             (Ok(run), Ok(tgt)) if tgt < run => blockers.push(Blocker::Downgrade {
                 component: c,
@@ -217,6 +224,30 @@ pub fn preflight(i: &PreflightInput<'_>) -> Preflight {
     }
 }
 
+/// When the registry holds a single platform's manifest (not the index),
+/// the platform that digest belongs to; only that platform can be pulled.
+fn single_platform_present<'m>(
+    img: &'m ComponentImage,
+    presence: &ImagePresence,
+) -> Option<&'m str> {
+    match presence {
+        ImagePresence::Present { digest } if *digest != img.index_digest => img
+            .platform_digests
+            .iter()
+            .find(|(_, d)| *d == digest)
+            .map(|(p, _)| p.as_str()),
+        _ => None,
+    }
+}
+
+/// Build metadata carries no precedence (`1.2.0+a` → `1.2.0+b` is not a
+/// downgrade), but the semver crate orders on it; drop it before comparing.
+fn parse_ignoring_build(v: &str) -> Result<semver::Version, semver::Error> {
+    let mut parsed = semver::Version::parse(v)?;
+    parsed.build = semver::BuildMetadata::EMPTY;
+    Ok(parsed)
+}
+
 /// A requirement or version that cannot be parsed does not satisfy it.
 fn upgrade_path_ok(req: &str, running: &str) -> bool {
     match (
@@ -231,6 +262,10 @@ fn upgrade_path_ok(req: &str, running: &str) -> bool {
 /// `>=1.2.0-dev` must admit `1.2.50-dev`; semver only matches a prerelease
 /// against a comparator of the same major.minor.patch, so compare the
 /// release parts instead.
+///
+/// This over-admits within one major.minor.patch (`>=1.2.0-rc.2` admits
+/// `1.2.0-rc.1`). Acceptable: `upgrade_from` is a floor, and the stricter
+/// checks (downgrade, schema head) still run per component.
 fn matches_ignoring_pre(r: &semver::VersionReq, v: &semver::Version) -> bool {
     let mut stripped = v.clone();
     stripped.pre = semver::Prerelease::EMPTY;

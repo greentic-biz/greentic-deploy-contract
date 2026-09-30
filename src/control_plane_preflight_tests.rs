@@ -201,3 +201,98 @@ fn pending_plus_unobserved_reports_restore_the_stricter_answer() {
         }
     );
 }
+
+fn run_on(
+    m: &ControlPlaneManifest,
+    p: &BTreeMap<Component, ImagePresence>,
+    platforms: &[String],
+) -> Preflight {
+    let o = [
+        obs(Component::Admin, "1.2.50-dev", Some(20260929060000)),
+        obs(Component::Designer, "1.2.500-dev", Some(20260930090000)),
+    ];
+    preflight(&PreflightInput {
+        manifest: m,
+        observed: &o,
+        presence: p,
+        node_platforms: platforms,
+    })
+}
+
+#[test]
+fn a_single_platform_child_only_serves_its_own_platform() {
+    let m = m();
+    let mut pr = present_all(&m);
+    pr.insert(
+        Component::Admin,
+        ImagePresence::Present {
+            digest: m.components[0].platform_digests["linux/amd64"].clone(),
+        },
+    );
+    let both = ["linux/amd64".to_string(), "linux/arm64".to_string()];
+    let p = run_on(&m, &pr, &both);
+    assert!(p.blockers.contains(&Blocker::PlatformUnavailable {
+        component: Component::Admin,
+        platform: "linux/arm64".into(),
+    }));
+    assert!(!p.blockers.contains(&Blocker::PlatformUnavailable {
+        component: Component::Admin,
+        platform: "linux/amd64".into(),
+    }));
+
+    let p = run_on(&m, &pr, &["linux/amd64".to_string()]);
+    assert!(p.admissible(), "{p:?}");
+}
+
+#[test]
+fn build_metadata_is_not_a_downgrade() {
+    let mut m = m();
+    m.components[0].app_version = "1.2.50-dev+a".into();
+    let o = [
+        obs(Component::Admin, "1.2.50-dev+b", Some(20260929060000)),
+        obs(Component::Designer, "1.2.500-dev", Some(20260930090000)),
+    ];
+    let p = run(&m, &o, &present_all(&m));
+    assert!(p.admissible(), "{p:?}");
+    assert!(p.warnings.contains(&Warning::AlreadyRunning {
+        component: Component::Admin
+    }));
+}
+
+#[test]
+fn an_unobserved_db_head_makes_rollback_unknown() {
+    let m = m();
+    let o = [
+        obs(Component::Admin, "1.2.50-dev", None),
+        obs(Component::Designer, "1.2.500-dev", Some(20260930090000)),
+    ];
+    let p = run(&m, &o, &present_all(&m));
+    assert!(p.admissible());
+    assert_eq!(p.rollback, Rollback::Unknown);
+}
+
+#[test]
+fn an_unreadable_running_version_warns() {
+    let m = m();
+    let o = [
+        obs(Component::Admin, "1.2.50-dev", Some(20260929060000)),
+        obs(Component::Designer, "garbage", Some(20260930090000)),
+    ];
+    let p = run(&m, &o, &present_all(&m));
+    assert!(p.warnings.contains(&Warning::VersionUnreadable {
+        component: Component::Designer,
+        running: "garbage".into(),
+    }));
+}
+
+#[test]
+fn a_component_missing_from_the_presence_map_is_unknown() {
+    let m = m();
+    let mut pr = present_all(&m);
+    pr.remove(&Component::Designer);
+    let p = run_on(&m, &pr, &["linux/amd64".to_string()]);
+    assert!(p.admissible());
+    assert!(p.warnings.contains(&Warning::ImagePresenceUnknown {
+        component: Component::Designer
+    }));
+}

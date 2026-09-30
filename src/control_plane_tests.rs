@@ -294,3 +294,78 @@ fn short_names_round_trip() {
     assert_eq!(Component::Admin.short_name(), "admin");
     assert_eq!(Component::from_short("edge"), None);
 }
+
+#[test]
+fn every_remaining_validate_arm_refuses() {
+    let mut m = sample();
+    m.components.clear();
+    assert_eq!(m.validate(), Err(ControlPlaneError::NoComponents));
+
+    let mut m = sample();
+    m.components[0].source_repository = "  ".into();
+    assert_eq!(
+        m.validate(),
+        Err(ControlPlaneError::BlankRepository(Component::Admin))
+    );
+
+    let mut m = sample();
+    m.components[0]
+        .platform_digests
+        .insert("linux/amd64".into(), "sha256:short".into());
+    assert_eq!(
+        m.validate(),
+        Err(ControlPlaneError::BadDigest(
+            "components[].platform_digests"
+        ))
+    );
+
+    let mut m = sample();
+    m.chart.digest = "md5:abc".into();
+    assert_eq!(
+        m.validate(),
+        Err(ControlPlaneError::BadDigest("chart.digest"))
+    );
+
+    let mut m = sample();
+    m.version = "v1".into();
+    assert_eq!(m.validate(), Err(ControlPlaneError::BadVersion("version")));
+}
+
+#[test]
+fn strings_reaching_a_helm_command_are_constrained() {
+    for bad in ["", "Greentic", "-greentic", "green tic", "greentic;rm"] {
+        let mut m = sample();
+        m.chart.name = bad.into();
+        assert_eq!(m.validate(), Err(ControlPlaneError::BadChartName), "{bad}");
+    }
+    let mut m = sample();
+    m.chart.version = "0.2".into();
+    assert_eq!(
+        m.validate(),
+        Err(ControlPlaneError::BadVersion("chart.version"))
+    );
+    for bad in ["-ghcr.io/x", "ghcr.io/x y", "ghcr.io/x;rm", "ghcr.io/$(x)"] {
+        let mut m = sample();
+        m.components[1].source_repository = bad.into();
+        assert_eq!(
+            m.validate(),
+            Err(ControlPlaneError::BadRepository(Component::Designer)),
+            "{bad}"
+        );
+    }
+    let mut m = sample();
+    m.components[1].source_repository = "registry.example:5000/Greentic/designer_x".into();
+    assert_eq!(m.validate(), Ok(()));
+}
+
+#[test]
+fn wrong_release_name_is_inconsistent() {
+    let m = sample();
+    let md = d('7');
+    let mut r = request_for(&m, &md);
+    r.name = "greentic-other".into();
+    assert_eq!(
+        consistent_with(&m, &md, &r),
+        Err(ConsistencyError::WrongName)
+    );
+}

@@ -128,6 +128,13 @@ pub enum ControlPlaneError {
     BadSchemaHead(Component),
     BadUpgradeFrom,
     BlankRepository(Component),
+    /// `source_repository` holds a character outside `[A-Za-z0-9._/:-]` or
+    /// does not start with a letter or digit. It is interpolated into an
+    /// operator-copied `helm upgrade` command, so the charset is closed.
+    BadRepository(Component),
+    /// `chart.name` is empty, holds a character outside `[a-z0-9-]`, or does
+    /// not start with a letter or digit (a leading `-` would read as a flag).
+    BadChartName,
 }
 
 impl std::fmt::Display for ControlPlaneError {
@@ -139,6 +146,16 @@ impl std::error::Error for ControlPlaneError {}
 
 fn digest_ok(d: &str) -> bool {
     crate::sha256_prefixed(d).as_deref() == Some(d)
+}
+
+/// Non-empty, first byte alphanumeric, every byte in `extra` or alphanumeric
+/// (lowercase only when `lowercase`). Used for strings that end up in a shell
+/// command an operator copies.
+fn shell_safe(s: &str, lowercase: bool, extra: &[u8]) -> bool {
+    let alnum = |b: u8| {
+        b.is_ascii_digit() || b.is_ascii_lowercase() || (!lowercase && b.is_ascii_uppercase())
+    };
+    s.bytes().next().is_some_and(alnum) && s.bytes().all(|b| alnum(b) || extra.contains(&b))
 }
 
 fn platform_ok(p: &str) -> bool {
@@ -173,6 +190,9 @@ impl ControlPlaneManifest {
             if c.source_repository.trim().is_empty() {
                 return Err(ControlPlaneError::BlankRepository(c.component));
             }
+            if !shell_safe(&c.source_repository, false, b"._/:-") {
+                return Err(ControlPlaneError::BadRepository(c.component));
+            }
             if !digest_ok(&c.index_digest) {
                 return Err(ControlPlaneError::BadDigest(
                     INDEX_FIELDS
@@ -206,6 +226,12 @@ impl ControlPlaneManifest {
                 return Err(ControlPlaneError::BadSchemaHead(c.component));
             }
         }
+        if !shell_safe(&self.chart.name, true, b"-") {
+            return Err(ControlPlaneError::BadChartName);
+        }
+        if semver::Version::parse(&self.chart.version).is_err() {
+            return Err(ControlPlaneError::BadVersion("chart.version"));
+        }
         if !digest_ok(&self.chart.digest) {
             return Err(ControlPlaneError::BadDigest("chart.digest"));
         }
@@ -220,7 +246,61 @@ impl ControlPlaneManifest {
     pub fn component(&self, c: Component) -> Option<&ComponentImage> {
         self.components.iter().find(|x| x.component == c)
     }
+
+    /// Parse manifest bytes, telling "a newer release than this reader
+    /// understands" apart from "not a manifest at all".
+    ///
+    /// Parsing stays strict (`deny_unknown_fields`, closed [`Component`]
+    /// enum): any addition to the manifest requires a new schema string. The
+    /// lenient [`ControlPlaneManifestHeader`] probe is what lets an OLDER
+    /// admin answer "this release needs a newer admin" (and name the
+    /// `upgrade_from` it asks for) instead of an internal error.
+    ///
+    /// Does not call [`ControlPlaneManifest::validate`]; callers still must.
+    pub fn parse(bytes: &[u8]) -> Result<ControlPlaneManifest, ManifestParseError> {
+        let header: ControlPlaneManifestHeader = serde_json::from_slice(bytes)
+            .map_err(|e| ManifestParseError::Malformed(e.to_string()))?;
+        if header.schema != CONTROL_PLANE_SCHEMA {
+            return Err(ManifestParseError::UnsupportedSchema {
+                schema: header.schema,
+            });
+        }
+        serde_json::from_slice(bytes).map_err(|_| ManifestParseError::NewerThanThisReader {
+            schema: header.schema,
+            upgrade_from: header.upgrade_from,
+        })
+    }
 }
+
+/// The two fields every control-plane manifest version must keep readable.
+/// Deliberately NOT `deny_unknown_fields`: it ignores everything else.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct ControlPlaneManifestHeader {
+    pub schema: String,
+    #[serde(default)]
+    pub upgrade_from: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManifestParseError {
+    /// The schema string is not [`CONTROL_PLANE_SCHEMA`].
+    UnsupportedSchema { schema: String },
+    /// The header carries the known schema but the strict parse fails —
+    /// e.g. an unknown component or field. The release needs a newer admin.
+    NewerThanThisReader {
+        schema: String,
+        upgrade_from: Option<String>,
+    },
+    /// Not even the header parses.
+    Malformed(String),
+}
+
+impl std::fmt::Display for ManifestParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for ManifestParseError {}
 
 /// What a component binary knows about itself at build time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +327,44 @@ pub struct ControlPlaneObservation {
     pub db_schema_head: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservationError {
+    BadImageDigest,
+    BadVersion,
+    BadEmbeddedSchemaHead,
+    BadDbSchemaHead,
+}
+
+impl std::fmt::Display for ObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for ObservationError {}
+
+impl ControlPlaneObservation {
+    /// Shape checks a receiver (the admin's observation route) applies before
+    /// trusting a report: digest format when present, semver `app_version`,
+    /// positive schema heads.
+    pub fn validate(&self) -> Result<(), ObservationError> {
+        if let Some(d) = &self.image_digest
+            && !digest_ok(d)
+        {
+            return Err(ObservationError::BadImageDigest);
+        }
+        if semver::Version::parse(&self.build.app_version).is_err() {
+            return Err(ObservationError::BadVersion);
+        }
+        if self.build.embedded_schema_head <= 0 {
+            return Err(ObservationError::BadEmbeddedSchemaHead);
+        }
+        if self.db_schema_head.is_some_and(|h| h <= 0) {
+            return Err(ObservationError::BadDbSchemaHead);
+        }
+        Ok(())
+    }
 }
 
 pub fn image_pin_name(c: Component) -> String {
@@ -345,6 +463,10 @@ pub fn consistent_with(
 #[cfg(test)]
 #[path = "control_plane_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "control_plane_parse_tests.rs"]
+mod parse_tests;
 
 #[cfg(test)]
 pub(crate) mod tests_support {
