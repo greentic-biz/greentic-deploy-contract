@@ -30,15 +30,20 @@ pub const PRIVATE_REGISTRY_AUTH: &str = "private_registry_auth";
 pub const MULTI_INSTANCE_SAFE: &str = "multi_instance_safe";
 /// Remove (retire) a unit explicitly.
 pub const REMOVE: &str = "remove";
+/// Run a revision on a runtime image pinned per REVISION rather than per
+/// environment (unified update L2). Needed to change one unit's runtime
+/// without re-staging every unit of its environment.
+pub const RUNTIME_PIN: &str = "runtime_pin";
 
 /// Every capability name, in declaration order.
-pub const ALL: [&str; 6] = [
+pub const ALL: [&str; 7] = [
     DRAIN,
     TRAFFIC_SPLIT,
     INGRESS_MANAGED,
     PRIVATE_REGISTRY_AUTH,
     MULTI_INSTANCE_SAFE,
     REMOVE,
+    RUNTIME_PIN,
 ];
 
 /// What one adapter can do. See the module doc for the defaults.
@@ -51,6 +56,7 @@ pub struct AdapterCapabilities {
     pub private_registry_auth: bool,
     pub multi_instance_safe: bool,
     pub remove: bool,
+    pub runtime_pin: bool,
 }
 
 impl AdapterCapabilities {
@@ -63,6 +69,7 @@ impl AdapterCapabilities {
             PRIVATE_REGISTRY_AUTH => self.private_registry_auth,
             MULTI_INSTANCE_SAFE => self.multi_instance_safe,
             REMOVE => self.remove,
+            RUNTIME_PIN => self.runtime_pin,
             _ => false,
         }
     }
@@ -99,6 +106,16 @@ pub fn required_capabilities_for(demand: &PlanDemand<'_>) -> Vec<&'static str> {
         (REMOVE, removes),
     ];
     needs
+        .into_iter()
+        .filter_map(|(name, needed)| needed.then_some(name))
+        .collect()
+}
+
+/// The capability names a runtime (platform) change needs, in [`ALL`] order:
+/// `traffic_split` when a step is below 100, and always `runtime_pin`.
+pub fn required_for_runtime_change(traffic_steps: &[u8]) -> Vec<&'static str> {
+    let splits = traffic_steps.iter().any(|s| *s < 100);
+    [(TRAFFIC_SPLIT, splits), (RUNTIME_PIN, true)]
         .into_iter()
         .filter_map(|(name, needed)| needed.then_some(name))
         .collect()

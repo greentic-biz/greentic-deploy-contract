@@ -39,12 +39,14 @@ pub mod capabilities;
 pub mod dsse;
 pub mod execution;
 pub mod execution_v2;
+pub mod execution_v3;
 pub mod governance;
 pub mod health;
 pub mod inventory;
 pub mod migration;
 pub mod offline;
 pub mod release;
+pub mod release_runtime;
 pub mod revocation;
 #[cfg(feature = "signing")]
 pub mod signed;

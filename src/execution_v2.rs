@@ -221,8 +221,10 @@ impl ExecutionAuthorisationV2 {
 /// fields both versions share; [`Self::operation`] maps v1's operation into
 /// the v2 vocabulary, so a receiver matches on one enum.
 ///
-/// `#[non_exhaustive]`: a v3 adds a variant without breaking consumers,
-/// whose wildcard arm must REFUSE, never execute.
+/// `#[non_exhaustive]`, and a v3 authorisation is NOT a variant of it: v3
+/// verifies through [`crate::execution_v3::verify_any_v3`] into
+/// [`crate::execution_v3::VerifiedAny`]. A wildcard arm here must REFUSE,
+/// never execute.
 ///
 /// v1 and v2 share ONE sequence stream per `(installation_id,
 /// environment_id)`: a receiver's replay check must key on

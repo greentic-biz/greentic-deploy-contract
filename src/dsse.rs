@@ -145,6 +145,9 @@ mod signing {
         /// A v2 authorisation parsed but fails
         /// [`ExecutionAuthorisationV2::validate`](crate::execution_v2::ExecutionAuthorisationV2::validate).
         InvalidV2(crate::execution_v2::ValidationErrorV2),
+        /// A v3 authorisation parsed but fails
+        /// [`ExecutionAuthorisationV3::validate`](crate::execution_v3::ExecutionAuthorisationV3::validate).
+        InvalidV3(crate::execution_v3::ValidationErrorV3),
     }
 
     impl std::fmt::Display for VerifyError {
@@ -170,6 +173,7 @@ mod signing {
                 }
                 Self::Invalid(e) => write!(f, "authorisation is invalid: {e}"),
                 Self::InvalidV2(e) => write!(f, "v2 authorisation is invalid: {e}"),
+                Self::InvalidV3(e) => write!(f, "v3 authorisation is invalid: {e}"),
             }
         }
     }
@@ -180,6 +184,7 @@ mod signing {
                 Self::BadPayload(e) => Some(e),
                 Self::Invalid(e) => Some(e),
                 Self::InvalidV2(e) => Some(e),
+                Self::InvalidV3(e) => Some(e),
                 _ => None,
             }
         }
