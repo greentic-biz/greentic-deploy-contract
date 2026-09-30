@@ -59,11 +59,17 @@ pub struct ExecutionAuthorisationV3 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ValidationErrorV3 {
+    /// A field every schema version shares failed the common checks.
     Common(ValidationError),
+    /// The named unit's target bundle differs from its expected baseline.
     BundleChanged(String),
+    /// The named unit's target configuration differs from its baseline.
     OverridesChanged(String),
+    /// The named unit runs no bundle, so has no runtime to change.
     NothingDeployed(String),
+    /// The named unit lacks an expected or a target runtime digest.
     RuntimeMissing(String),
+    /// The named unit names the same runtime on both sides.
     RuntimeUnchanged(String),
 }
 
@@ -153,6 +159,44 @@ impl ExecutionAuthorisationV3 {
 pub enum VerifiedAny {
     Change(VerifiedAuthorisation),
     Runtime(ExecutionAuthorisationV3),
+}
+
+macro_rules! delegate_ref {
+    ($($name:ident),* $(,)?) => {$(
+        pub fn $name(&self) -> &str {
+            match self {
+                Self::Change(a) => a.$name(),
+                Self::Runtime(a) => &a.$name,
+            }
+        }
+    )*};
+}
+
+impl VerifiedAny {
+    delegate_ref!(authorisation_id, installation_id, tenant_id, environment_id);
+
+    /// v1, v2 and v3 share ONE sequence stream per
+    /// `(installation_id, environment_id)`; replay checks key on this.
+    pub fn sequence(&self) -> u64 {
+        match self {
+            Self::Change(a) => a.sequence(),
+            Self::Runtime(a) => a.sequence,
+        }
+    }
+
+    pub fn fence(&self) -> i64 {
+        match self {
+            Self::Change(a) => a.fence(),
+            Self::Runtime(a) => a.fence,
+        }
+    }
+
+    pub fn expires_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Change(a) => a.expires_at(),
+            Self::Runtime(a) => a.expires_at,
+        }
+    }
 }
 
 #[cfg(feature = "signing")]

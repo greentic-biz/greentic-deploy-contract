@@ -5,12 +5,14 @@
 use crate::release::{RegisterReleaseRequest, ReleaseArtifact, ReleaseKind};
 
 pub const RUNTIME_IMAGE_ARTIFACT: &str = "greentic-start-distroless";
-/// The runtime digest is the image INDEX digest (multi-arch), which is what
-/// the designer pins; a single-platform manifest is accepted too.
-pub const OCI_MEDIA_TYPES: [&str; 2] = [
-    "application/vnd.oci.image.index.v1+json",
-    "application/vnd.oci.image.manifest.v1+json",
-];
+/// The ONLY media type accepted: the runtime digest is the image INDEX digest
+/// (multi-arch), which is what the designer pins. A single-platform manifest
+/// is refused (`NoRuntimeImage`).
+///
+/// Neither the artifact's `source` nor the form of its `digest` is checked
+/// here; a malformed digest is refused by `check_digest` when the
+/// authorisation is signed.
+pub const OCI_IMAGE_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 
 /// Why a release has no single identifiable runtime image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +45,7 @@ pub fn runtime_image_artifact(
         a.name == RUNTIME_IMAGE_ARTIFACT
             && a.media_type
                 .as_deref()
-                .is_some_and(|m| OCI_MEDIA_TYPES.contains(&m))
+                .is_some_and(|m| m == OCI_IMAGE_INDEX_MEDIA_TYPE)
     });
     match (found.next(), found.next()) {
         (Some(a), None) => Ok(a),
@@ -97,7 +99,11 @@ mod tests {
             ReleaseKind::Platform,
             vec![
                 art("greentic-start", None, 'a'),
-                art(RUNTIME_IMAGE_ARTIFACT, Some(OCI_MEDIA_TYPES[0]), 'f'),
+                art(
+                    RUNTIME_IMAGE_ARTIFACT,
+                    Some(OCI_IMAGE_INDEX_MEDIA_TYPE),
+                    'f',
+                ),
             ],
         );
         assert_eq!(
@@ -131,12 +137,36 @@ mod tests {
     }
 
     #[test]
+    fn a_single_platform_manifest_is_not_the_runtime_image() {
+        let r = req(
+            ReleaseKind::Platform,
+            vec![art(
+                RUNTIME_IMAGE_ARTIFACT,
+                Some("application/vnd.oci.image.manifest.v1+json"),
+                'a',
+            )],
+        );
+        assert_eq!(
+            runtime_image_artifact(&r).err(),
+            Some(RuntimeImageError::NoRuntimeImage)
+        );
+    }
+
+    #[test]
     fn two_runtime_images_are_ambiguous() {
         let r = req(
             ReleaseKind::Platform,
             vec![
-                art(RUNTIME_IMAGE_ARTIFACT, Some(OCI_MEDIA_TYPES[0]), 'a'),
-                art(RUNTIME_IMAGE_ARTIFACT, Some(OCI_MEDIA_TYPES[1]), 'b'),
+                art(
+                    RUNTIME_IMAGE_ARTIFACT,
+                    Some(OCI_IMAGE_INDEX_MEDIA_TYPE),
+                    'a',
+                ),
+                art(
+                    RUNTIME_IMAGE_ARTIFACT,
+                    Some(OCI_IMAGE_INDEX_MEDIA_TYPE),
+                    'b',
+                ),
             ],
         );
         assert_eq!(
@@ -149,7 +179,11 @@ mod tests {
     fn an_application_release_is_not_a_platform_one() {
         let r = req(
             ReleaseKind::Application,
-            vec![art(RUNTIME_IMAGE_ARTIFACT, Some(OCI_MEDIA_TYPES[0]), 'a')],
+            vec![art(
+                RUNTIME_IMAGE_ARTIFACT,
+                Some(OCI_IMAGE_INDEX_MEDIA_TYPE),
+                'a',
+            )],
         );
         assert_eq!(
             runtime_image_artifact(&r).err(),

@@ -102,6 +102,53 @@ fn both_runtimes_are_required_and_must_differ() {
 }
 
 #[test]
+fn a_missing_target_runtime_is_refused() {
+    let mut a = runtime_update();
+    a.units[0].target.runtime_image_digest = None;
+    assert_eq!(
+        a.validate(),
+        Err(ValidationErrorV3::RuntimeMissing("canvas:bot".into()))
+    );
+}
+
+#[test]
+fn the_error_names_the_second_unit_when_only_it_is_bad() {
+    let mut a = runtime_update();
+    let mut second = a.units[0].clone();
+    second.unit_id = "canvas:other".into();
+    second.target.bundle_digest = Some(d('c'));
+    a.units.push(second);
+    assert_eq!(
+        a.validate(),
+        Err(ValidationErrorV3::BundleChanged("canvas:other".into()))
+    );
+}
+
+#[test]
+fn verified_any_accessors_read_both_arms() {
+    use crate::execution_v3::VerifiedAny;
+    let v3 = runtime_update();
+    let any = VerifiedAny::Runtime(v3.clone());
+    assert_eq!(any.sequence(), 7);
+    assert_eq!(any.fence(), 3);
+    assert_eq!(any.installation_id(), "inst");
+    assert_eq!(any.environment_id(), "env");
+    assert_eq!(any.authorisation_id(), "a-1");
+    assert_eq!(any.tenant_id(), "t");
+    assert_eq!(any.expires_at(), v3.expires_at);
+
+    let v2 = crate::execution_v2::tests::remove_sample();
+    let any = VerifiedAny::Change(crate::execution_v2::VerifiedAuthorisation::V2(v2.clone()));
+    assert_eq!(any.sequence(), v2.sequence);
+    assert_eq!(any.fence(), v2.fence);
+    assert_eq!(any.installation_id(), v2.installation_id);
+    assert_eq!(any.environment_id(), v2.environment_id);
+    assert_eq!(any.authorisation_id(), v2.authorisation_id);
+    assert_eq!(any.tenant_id(), v2.tenant_id);
+    assert_eq!(any.expires_at(), v2.expires_at);
+}
+
+#[test]
 fn a_rollback_follows_the_same_rules() {
     let mut a = runtime_update();
     a.operation = ExecOperationV3::RuntimeRollback;
@@ -130,8 +177,12 @@ mod signing {
     use ed25519_dalek::SigningKey;
 
     use super::runtime_update;
+    use crate::dsse::{VerifyError, sign_bytes};
     use crate::execution_v2::verify_any;
-    use crate::execution_v3::{VerifiedAny, sign_v3, verify_any_v3};
+    use crate::execution_v3::{
+        EXECUTION_AUTHORISATION_V3_PAYLOAD_TYPE, SignV3Error, ValidationErrorV3, VerifiedAny,
+        sign_v3, verify_any_v3, verify_v3,
+    };
 
     fn key() -> SigningKey {
         SigningKey::from_bytes(&[7u8; 32])
@@ -169,6 +220,27 @@ mod signing {
     fn an_invalid_v3_is_not_signed() {
         let mut a = runtime_update();
         a.units[0].target.bundle_digest = None;
-        assert!(sign_v3(&a, &key()).is_err());
+        assert!(matches!(
+            sign_v3(&a, &key()),
+            Err(SignV3Error::Invalid(ValidationErrorV3::BundleChanged(_)))
+        ));
+    }
+
+    /// Well-signed but invalid: both entry points refuse it as InvalidV3.
+    #[test]
+    fn a_well_signed_invalid_v3_is_refused_by_both_verifiers() {
+        let mut a = runtime_update();
+        a.units[0].target.bundle_digest = Some(super::d('c'));
+        let payload = serde_json::to_vec(&a).expect("ser");
+        let env = sign_bytes(EXECUTION_AUTHORISATION_V3_PAYLOAD_TYPE, &payload, &[&key()]);
+        let trusted = [key().verifying_key()];
+        assert!(matches!(
+            verify_v3(&env, &trusted),
+            Err(VerifyError::InvalidV3(_))
+        ));
+        assert!(matches!(
+            verify_any_v3(&env, &trusted),
+            Err(VerifyError::InvalidV3(_))
+        ));
     }
 }
