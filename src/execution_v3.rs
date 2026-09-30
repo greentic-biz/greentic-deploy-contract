@@ -155,6 +155,12 @@ pub enum VerifiedAny {
     Runtime(ExecutionAuthorisationV3),
 }
 
+#[cfg(feature = "signing")]
+#[path = "execution_v3_sign.rs"]
+mod sign;
+#[cfg(feature = "signing")]
+pub use sign::{SignV3Error, sign_v3, verify_any_v3, verify_v3};
+
 #[cfg(test)]
 #[path = "execution_v3_tests.rs"]
 pub(crate) mod tests;

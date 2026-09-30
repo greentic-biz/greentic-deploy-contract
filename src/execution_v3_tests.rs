@@ -124,3 +124,51 @@ fn the_wrong_schema_is_refused() {
     a.schema = "greentic.execution-authorisation.v2".into();
     assert!(matches!(a.validate(), Err(ValidationErrorV3::Common(_))));
 }
+
+#[cfg(feature = "signing")]
+mod signing {
+    use ed25519_dalek::SigningKey;
+
+    use super::runtime_update;
+    use crate::execution_v2::verify_any;
+    use crate::execution_v3::{VerifiedAny, sign_v3, verify_any_v3};
+
+    fn key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    #[test]
+    fn a_v3_envelope_round_trips_through_verify_any_v3() {
+        let env = sign_v3(&runtime_update(), &key()).expect("signs");
+        let got = verify_any_v3(&env, &[key().verifying_key()]).expect("verifies");
+        assert_eq!(got, VerifiedAny::Runtime(runtime_update()));
+    }
+
+    /// A designer built before v3 calls `verify_any`; it must refuse a v3
+    /// envelope rather than parse it as something it knows.
+    #[test]
+    fn the_v1_v2_verifier_refuses_a_v3_envelope() {
+        let env = sign_v3(&runtime_update(), &key()).expect("signs");
+        assert!(matches!(
+            verify_any(&env, &[key().verifying_key()]),
+            Err(crate::dsse::VerifyError::WrongPayloadType)
+        ));
+    }
+
+    #[test]
+    fn a_v2_envelope_still_verifies_as_a_change() {
+        let v2 = crate::execution_v2::tests::remove_sample();
+        let env = crate::execution_v2::sign_v2(&v2, &key()).expect("signs");
+        assert!(matches!(
+            verify_any_v3(&env, &[key().verifying_key()]),
+            Ok(VerifiedAny::Change(_))
+        ));
+    }
+
+    #[test]
+    fn an_invalid_v3_is_not_signed() {
+        let mut a = runtime_update();
+        a.units[0].target.bundle_digest = None;
+        assert!(sign_v3(&a, &key()).is_err());
+    }
+}
