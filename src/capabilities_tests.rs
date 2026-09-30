@@ -92,3 +92,27 @@ fn every_named_capability_maps_to_its_field() {
         assert_eq!(ALL.iter().filter(|n| caps.has(n)).count(), 1, "{name}");
     }
 }
+
+#[test]
+fn runtime_pin_is_absent_from_an_old_report() {
+    let old: AdapterCapabilities =
+        serde_json::from_str(r#"{"drain":true,"traffic_split":true,"remove":true}"#)
+            .expect("parses");
+    assert!(!old.runtime_pin);
+    assert!(!old.has(RUNTIME_PIN));
+}
+
+#[test]
+fn a_runtime_change_needs_runtime_pin_and_split_when_stepping() {
+    assert_eq!(
+        required_for_runtime_change(&[10, 50, 100]),
+        vec![TRAFFIC_SPLIT, RUNTIME_PIN]
+    );
+    assert_eq!(required_for_runtime_change(&[100]), vec![RUNTIME_PIN]);
+}
+
+#[test]
+fn all_lists_runtime_pin_last() {
+    assert_eq!(ALL.last(), Some(&RUNTIME_PIN));
+    assert_eq!(ALL.len(), 7);
+}
