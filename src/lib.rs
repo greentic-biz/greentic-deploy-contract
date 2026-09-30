@@ -46,6 +46,7 @@ pub mod inventory;
 pub mod migration;
 pub mod offline;
 pub mod release;
+pub mod release_runtime;
 pub mod revocation;
 #[cfg(feature = "signing")]
 pub mod signed;
