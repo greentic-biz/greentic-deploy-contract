@@ -24,6 +24,7 @@ mod timestamp;
 mod types;
 
 pub use enums::{DeployTarget, EnvStatus, JobStatus};
+pub use release::sha256_prefixed;
 pub use timestamp::parse_lenient;
 pub use types::{DeploymentJob, EnvListItem, EnvOrigin, RunnerStatus};
 
@@ -36,6 +37,7 @@ pub use types::{DeploymentJob, EnvListItem, EnvOrigin, RunnerStatus};
 pub const MAX_SEQUENCE: u64 = (1 << 53) - 1;
 
 pub mod capabilities;
+pub mod control_plane;
 pub mod dsse;
 pub mod execution;
 pub mod execution_v2;
