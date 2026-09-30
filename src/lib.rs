@@ -38,6 +38,7 @@ pub const MAX_SEQUENCE: u64 = (1 << 53) - 1;
 
 pub mod capabilities;
 pub mod control_plane;
+pub mod control_plane_preflight;
 pub mod dsse;
 pub mod execution;
 pub mod execution_v2;
