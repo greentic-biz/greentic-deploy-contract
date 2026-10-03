@@ -86,6 +86,15 @@ pub struct EnvListItem {
     /// greentic-deployer's `init_image` answer. `None` keeps the deployer's
     /// own default.
     pub k8s_init_image: Option<String>,
+    /// Namespace a Kubernetes environment's workloads land in, forwarded as
+    /// greentic-deployer's `namespace` answer. `None` for every non-k8s
+    /// target, for an operator who never chose one, and for any admin older
+    /// than this field — which the designer reads as "derive it as before"
+    /// (`gtc-local`, or `gtc-<tenant>` for a partnership environment), never
+    /// as a guess.
+    ///
+    /// No `#[serde(default)]`: see `project` above.
+    pub k8s_namespace: Option<String>,
     #[serde(default, with = "crate::timestamp::opt_rfc3339")]
     pub last_deployed_at: Option<DateTime<Utc>>,
     #[serde(default, with = "crate::timestamp::opt_rfc3339")]
@@ -180,6 +189,7 @@ mod tests {
             "k8s_registry_insecure": null,
             "k8s_worker_image": null,
             "k8s_init_image": null,
+            "k8s_namespace": null,
             "last_deployed_at": "2026-07-30T10:00:00+00:00",
             "created_at": "2026-07-01T09:00:00+00:00",
             "updated_at": "2026-07-30T10:00:00+00:00",
@@ -203,6 +213,7 @@ mod tests {
         assert_eq!(obj["k8s_registry_insecure"], serde_json::Value::Null);
         assert_eq!(obj["k8s_worker_image"], serde_json::Value::Null);
         assert_eq!(obj["k8s_init_image"], serde_json::Value::Null);
+        assert_eq!(obj["k8s_namespace"], serde_json::Value::Null);
     }
 
     #[test]
@@ -474,6 +485,7 @@ mod tests {
         assert_eq!(item.k8s_registry_insecure, None);
         assert_eq!(item.k8s_worker_image, None);
         assert_eq!(item.k8s_init_image, None);
+        assert_eq!(item.k8s_namespace, None);
     }
 
     #[test]
@@ -494,6 +506,7 @@ mod tests {
             "k8s_registry_insecure": "true",
             "k8s_worker_image": "registry.client.local/greentic/greentic-start-distroless:1.2.3",
             "k8s_init_image": "registry.client.local/greentic/busybox:1.36.1",
+            "k8s_namespace": "3aigent-local",
             "last_deployed_at": null,
             "created_at": null,
             "updated_at": null,
@@ -508,6 +521,7 @@ mod tests {
         );
         let back = serde_json::to_value(&item).unwrap();
         assert_eq!(back["k8s_init_image"], json["k8s_init_image"]);
+        assert_eq!(back["k8s_namespace"], json["k8s_namespace"]);
     }
 
     #[test]
