@@ -533,3 +533,19 @@ fn complete_rejects_internal_registry_for_non_runtime_artifact() {
         Err(OfflineError::ArtifactMissing { .. })
     ));
 }
+
+#[test]
+fn complete_rejects_a_second_artifact_sharing_the_runtime_digest() {
+    let mut m = runtime_manifest(crate::release_runtime::RUNTIME_IMAGE_ARTIFACT, 'e');
+    let mut req = m.releases[0].request.clone();
+    let mut twin = req.artifacts[0].clone();
+    twin.name = "greentic-start-binary".into();
+    twin.media_type = None;
+    req.artifacts.push(twin);
+    m.releases[0].release_digest = release_digest(&req).unwrap();
+    m.releases[0].request = req;
+    assert!(matches!(
+        m.validate(),
+        Err(OfflineError::ArtifactMissing { .. })
+    ));
+}
