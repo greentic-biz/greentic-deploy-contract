@@ -479,3 +479,73 @@ fn an_invalid_migration_declaration_is_refused() {
     m.releases[0].release_digest = release_digest(&m.releases[0].request).unwrap();
     assert!(matches!(m.validate(), Err(OfflineError::BadRequest { .. })));
 }
+
+fn runtime_manifest(artifact_name: &str, entry_digest: char) -> OfflineReleaseManifest {
+    use crate::release_runtime::OCI_IMAGE_INDEX_MEDIA_TYPE;
+    let mut req = request();
+    req.kind = ReleaseKind::Platform;
+    req.artifacts = vec![ReleaseArtifact {
+        name: artifact_name.into(),
+        version: "1.3.0".into(),
+        digest: digest('e'),
+        target: None,
+        media_type: Some(OCI_IMAGE_INDEX_MEDIA_TYPE.into()),
+        source: Some("registry.internal/start".into()),
+    }];
+    req.dependencies.clear();
+    let mut m = sample();
+    m.releases[0].release_digest = release_digest(&req).unwrap();
+    m.releases[0].request = req;
+    m.inventory.clear();
+    m.max_unpacked_bytes = 0;
+    m.closure.entries = vec![ClosureEntry {
+        kind: DependencyKind::Runtime,
+        name: "greentic-start-runtime".into(),
+        version_req: None,
+        digest: None,
+        source: ClosureSource::InternalRegistry {
+            oci_ref: format!("registry.internal/start@{}", digest(entry_digest)),
+        },
+    }];
+    m
+}
+
+#[test]
+fn complete_accepts_runtime_artifact_covered_by_internal_registry_entry() {
+    let m = runtime_manifest(crate::release_runtime::RUNTIME_IMAGE_ARTIFACT, 'e');
+    assert_eq!(m.validate(), Ok(()));
+}
+
+#[test]
+fn complete_rejects_when_oci_ref_digest_differs() {
+    let m = runtime_manifest(crate::release_runtime::RUNTIME_IMAGE_ARTIFACT, 'f');
+    assert!(matches!(
+        m.validate(),
+        Err(OfflineError::ArtifactMissing { .. })
+    ));
+}
+
+#[test]
+fn complete_rejects_internal_registry_for_non_runtime_artifact() {
+    let m = runtime_manifest("greentic-start-binary", 'e');
+    assert!(matches!(
+        m.validate(),
+        Err(OfflineError::ArtifactMissing { .. })
+    ));
+}
+
+#[test]
+fn complete_rejects_a_second_artifact_sharing_the_runtime_digest() {
+    let mut m = runtime_manifest(crate::release_runtime::RUNTIME_IMAGE_ARTIFACT, 'e');
+    let mut req = m.releases[0].request.clone();
+    let mut twin = req.artifacts[0].clone();
+    twin.name = "greentic-start-binary".into();
+    twin.media_type = None;
+    req.artifacts.push(twin);
+    m.releases[0].release_digest = release_digest(&req).unwrap();
+    m.releases[0].request = req;
+    assert!(matches!(
+        m.validate(),
+        Err(OfflineError::ArtifactMissing { .. })
+    ));
+}
