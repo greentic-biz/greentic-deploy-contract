@@ -9,7 +9,8 @@ use super::{
     OFFLINE_RELEASE_SCHEMA, OfflineAdmitError, OfflineError, OfflineReleaseManifest, PackageMode,
 };
 use crate::execution::{is_clean_identifier, is_sha256_digest};
-use crate::release::release_digest;
+use crate::release::{RegisterReleaseRequest, release_digest};
+use crate::release_runtime::runtime_image_artifact;
 
 fn digest(value: &str, field: &'static str) -> Result<(), OfflineError> {
     if is_sha256_digest(value) {
@@ -193,7 +194,10 @@ impl OfflineReleaseManifest {
                 })?;
             for artifact in &entry.request.artifacts {
                 digest(&artifact.digest, "releases.request.artifacts.digest")?;
-                if complete && !inventory.contains(artifact.digest.as_str()) {
+                if complete
+                    && !inventory.contains(artifact.digest.as_str())
+                    && !self.registry_covers_runtime_image(&entry.request, &artifact.digest)
+                {
                     return Err(OfflineError::ArtifactMissing {
                         release_id: entry.release_id.clone(),
                         digest: artifact.digest.clone(),
@@ -219,6 +223,27 @@ impl OfflineReleaseManifest {
             }
         }
         Ok(())
+    }
+
+    /// A platform release's runtime image is never packaged as bytes: it is
+    /// an `InternalRegistry` closure entry pinned to the image index digest.
+    /// Only that one artifact may be covered this way; every other artifact
+    /// of a `complete` package must be in the inventory.
+    fn registry_covers_runtime_image(
+        &self,
+        request: &RegisterReleaseRequest,
+        artifact_digest: &str,
+    ) -> bool {
+        let Ok(runtime) = runtime_image_artifact(request) else {
+            return false;
+        };
+        runtime.digest == artifact_digest
+            && self.closure.entries.iter().any(|c| match &c.source {
+                ClosureSource::InternalRegistry { oci_ref } => {
+                    pinned_digest(oci_ref) == Some(artifact_digest)
+                }
+                _ => false,
+            })
     }
 
     fn validate_closure(&self, inventory: &BTreeSet<&str>) -> Result<(), OfflineError> {
