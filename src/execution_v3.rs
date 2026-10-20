@@ -159,6 +159,8 @@ impl ExecutionAuthorisationV3 {
 pub enum VerifiedAny {
     Change(VerifiedAuthorisation),
     Runtime(ExecutionAuthorisationV3),
+    /// A v4 authorisation: v2's operations plus the release channel.
+    Channelled(crate::execution_v4::ExecutionAuthorisationV4),
 }
 
 macro_rules! delegate_ref {
@@ -167,6 +169,7 @@ macro_rules! delegate_ref {
             match self {
                 Self::Change(a) => a.$name(),
                 Self::Runtime(a) => &a.$name,
+                Self::Channelled(a) => &a.$name,
             }
         }
     )*};
@@ -175,12 +178,21 @@ macro_rules! delegate_ref {
 impl VerifiedAny {
     delegate_ref!(authorisation_id, installation_id, tenant_id, environment_id);
 
-    /// v1, v2 and v3 share ONE sequence stream per
+    /// The release channel, for a v4 authorisation only.
+    pub fn channel(&self) -> Option<crate::execution_v4::ReleaseChannel> {
+        match self {
+            Self::Channelled(a) => Some(a.channel),
+            _ => None,
+        }
+    }
+
+    /// v1 to v4 share ONE sequence stream per
     /// `(installation_id, environment_id)`; replay checks key on this.
     pub fn sequence(&self) -> u64 {
         match self {
             Self::Change(a) => a.sequence(),
             Self::Runtime(a) => a.sequence,
+            Self::Channelled(a) => a.sequence,
         }
     }
 
@@ -188,6 +200,7 @@ impl VerifiedAny {
         match self {
             Self::Change(a) => a.fence(),
             Self::Runtime(a) => a.fence,
+            Self::Channelled(a) => a.fence,
         }
     }
 
@@ -195,6 +208,7 @@ impl VerifiedAny {
         match self {
             Self::Change(a) => a.expires_at(),
             Self::Runtime(a) => a.expires_at,
+            Self::Channelled(a) => a.expires_at,
         }
     }
 }
