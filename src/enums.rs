@@ -12,6 +12,8 @@ pub enum DeployTarget {
     Azure,
     Gcp,
     K8s,
+    /// A single Linux host reached over SSH, run as a systemd service.
+    Vm,
     /// A value this build does not know. Carries the original string so the UI
     /// can show what the server actually said, and so re-serializing does not
     /// corrupt it.
@@ -55,6 +57,7 @@ impl DeployTarget {
             "azure" => Self::Azure,
             "gcp" => Self::Gcp,
             "k8s" => Self::K8s,
+            "vm" => Self::Vm,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -98,10 +101,20 @@ mod tests {
             (DeployTarget::Azure, "\"azure\""),
             (DeployTarget::Gcp, "\"gcp\""),
             (DeployTarget::K8s, "\"k8s\""),
+            (DeployTarget::Vm, "\"vm\""),
         ] {
             assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
             assert_eq!(serde_json::from_str::<DeployTarget>(wire).unwrap(), variant);
         }
+    }
+
+    #[test]
+    fn from_wire_recognises_vm() {
+        assert_eq!(DeployTarget::from_wire("vm"), DeployTarget::Vm);
+        assert_eq!(
+            DeployTarget::from_wire("vms"),
+            DeployTarget::Unknown("vms".to_string())
+        );
     }
 
     #[test]
