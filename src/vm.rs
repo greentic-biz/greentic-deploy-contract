@@ -20,6 +20,25 @@
 //! environment list the day the admin adds a key. Unknown keys are ignored.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// A tunnel the deployer opens to reach a `vm` that has no direct route.
+///
+/// `kind` is a free string (for example a provider name); validating it is the
+/// admin's and the deployer's job, so adding a provider needs no release of
+/// this contract. `settings` holds NON-SECRET values only (host, server, port,
+/// protocol, user name, peer public key, ...). Secret material (private keys,
+/// passwords, auth keys) never appears here: it is a sealed credential in the
+/// admin. A `BTreeMap` keeps the key order stable on the wire. Not
+/// `deny_unknown_fields`, so admin and designer can be upgraded separately.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmTunnel {
+    /// Tunnel provider kind. Free-form; validated downstream.
+    pub kind: String,
+    /// Non-secret provider settings.
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
+}
 
 /// Non-secret config of a `vm` environment. See the module docs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,4 +77,7 @@ pub struct VmEnvConfig {
     /// Account the service runs as. `None` = the login user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_user: Option<String>,
+    /// Optional tunnel used to reach the VM. `None` = connect directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<VmTunnel>,
 }

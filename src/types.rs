@@ -677,4 +677,59 @@ mod tests {
         assert_eq!(old.id, "env_vm");
         assert_eq!(old.target, DeployTarget::Vm);
     }
+
+    fn tunnel_item(tunnel: serde_json::Value) -> serde_json::Value {
+        let mut json = vm_base();
+        json["vm"] = serde_json::json!({"host": "h", "tunnel": tunnel});
+        json
+    }
+
+    #[test]
+    fn vm_without_tunnel_reads_as_none_and_omits_it() {
+        let mut json = vm_base();
+        json["vm"] = serde_json::json!({"host": "h"});
+        let item: EnvListItem = serde_json::from_value(json).unwrap();
+        assert_eq!(item.vm.as_ref().unwrap().tunnel, None);
+        let out = serde_json::to_value(&item).unwrap();
+        assert!(out["vm"].as_object().unwrap().get("tunnel").is_none());
+    }
+
+    #[test]
+    fn vm_tunnel_round_trips_with_stable_key_order() {
+        let json = tunnel_item(serde_json::json!({
+            "kind": "wireguard",
+            "settings": {"server": "s", "port": "51820", "peer_public_key": "k"}
+        }));
+        let item: EnvListItem = serde_json::from_value(json.clone()).unwrap();
+        let t = item.vm.as_ref().unwrap().tunnel.as_ref().unwrap();
+        assert_eq!(t.kind, "wireguard");
+        assert_eq!(t.settings.len(), 3);
+        let text = serde_json::to_string(&item.vm.as_ref().unwrap().tunnel).unwrap();
+        assert!(text.find("peer_public_key") < text.find("port"));
+        assert!(text.find("port") < text.find("server"));
+        assert_eq!(serde_json::to_value(&item).unwrap()["vm"], json["vm"]);
+    }
+
+    #[test]
+    fn vm_tunnel_settings_default_and_arbitrary_keys_are_read() {
+        let item: EnvListItem =
+            serde_json::from_value(tunnel_item(serde_json::json!({"kind": "x"}))).unwrap();
+        assert!(item.vm.unwrap().tunnel.unwrap().settings.is_empty());
+        let item: EnvListItem = serde_json::from_value(tunnel_item(
+            serde_json::json!({"kind": "x", "settings": {"brand_new": "1"}, "future": true}),
+        ))
+        .unwrap();
+        assert_eq!(item.vm.unwrap().tunnel.unwrap().settings["brand_new"], "1");
+    }
+
+    #[test]
+    fn a_vm_consumer_with_the_old_shape_ignores_tunnel() {
+        #[derive(serde::Deserialize)]
+        struct OldVm {
+            host: Option<String>,
+        }
+        let json = serde_json::json!({"host": "h", "tunnel": {"kind": "x", "settings": {}}});
+        let old: OldVm = serde_json::from_value(json).unwrap();
+        assert_eq!(old.host.as_deref(), Some("h"));
+    }
 }
