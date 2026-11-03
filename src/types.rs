@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::enums::{DeployTarget, EnvStatus, JobStatus};
+use crate::vm::VmEnvConfig;
 
 /// One environment as it appears in the designer's environment list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,6 +114,14 @@ pub struct EnvListItem {
     /// byte-for-byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<EnvOrigin>,
+    /// Non-secret config of a `vm` environment (host, SSH user, host key, …).
+    /// `None` for every other target and for any admin older than this field.
+    /// The SSH private key is never part of it.
+    ///
+    /// Skipped when `None` so every existing payload still round-trips
+    /// byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<VmEnvConfig>,
 }
 
 /// Where a projected environment comes from. See [`EnvListItem::origin`].
@@ -603,5 +612,69 @@ mod tests {
         let o: EnvOrigin = serde_json::from_value(json.clone()).unwrap();
         assert!(o.default);
         assert_eq!(serde_json::to_value(&o).unwrap(), json);
+    }
+
+    fn vm_base() -> serde_json::Value {
+        serde_json::json!({
+            "id": "env_vm", "team_slug": null, "name": "Edge", "target": "vm",
+            "status": "live", "status_detail": null, "region": null,
+            "has_credentials": true
+        })
+    }
+
+    #[test]
+    fn env_list_item_without_vm_reads_as_none() {
+        let item: EnvListItem = serde_json::from_value(vm_base()).unwrap();
+        assert_eq!(item.vm, None);
+    }
+
+    #[test]
+    fn env_list_item_vm_none_is_not_serialised() {
+        let item: EnvListItem = serde_json::from_value(vm_base()).unwrap();
+        let back = serde_json::to_value(&item).unwrap();
+        assert!(back.as_object().unwrap().get("vm").is_none());
+    }
+
+    #[test]
+    fn env_list_item_vm_round_trips() {
+        let mut json = vm_base();
+        json["vm"] = serde_json::json!({
+            "host": "vm.example.com", "port": 2222, "user": "greentic",
+            "host_key": "vm.example.com ssh-ed25519 AAAA",
+            "host_key_fingerprint": "SHA256:abc",
+            "install_dir": "/opt/greentic", "service_name": "greentic-prod",
+            "listen_port": 8080, "expose": false, "use_sudo": true,
+            "service_user": "greentic-svc"
+        });
+        let item: EnvListItem = serde_json::from_value(json.clone()).unwrap();
+        let vm = item.vm.as_ref().unwrap();
+        assert_eq!(vm.port, Some(2222));
+        assert_eq!(vm.expose, Some(false));
+        assert_eq!(serde_json::to_value(&item).unwrap()["vm"], json["vm"]);
+    }
+
+    #[test]
+    fn env_list_item_vm_ignores_unknown_keys_and_omits_blanks() {
+        let mut json = vm_base();
+        json["vm"] = serde_json::json!({"host": "h", "future_key": 1});
+        let item: EnvListItem = serde_json::from_value(json).unwrap();
+        let out = serde_json::to_value(&item).unwrap();
+        assert_eq!(out["vm"], serde_json::json!({"host": "h"}));
+    }
+
+    #[test]
+    fn a_consumer_with_the_old_shape_ignores_the_vm_field() {
+        // EnvListItem is not deny_unknown_fields, so a consumer built before
+        // `vm` existed (modelled by this copy) still reads a payload carrying it.
+        #[derive(serde::Deserialize)]
+        struct OldItem {
+            id: String,
+            target: DeployTarget,
+        }
+        let mut json = vm_base();
+        json["vm"] = serde_json::json!({"host": "vm.example.com"});
+        let old: OldItem = serde_json::from_value(json).unwrap();
+        assert_eq!(old.id, "env_vm");
+        assert_eq!(old.target, DeployTarget::Vm);
     }
 }
