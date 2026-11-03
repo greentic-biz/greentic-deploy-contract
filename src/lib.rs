@@ -22,11 +22,13 @@
 mod enums;
 mod timestamp;
 mod types;
+mod vm;
 
 pub use enums::{DeployTarget, EnvStatus, JobStatus};
 pub use release::sha256_prefixed;
 pub use timestamp::parse_lenient;
 pub use types::{DeploymentJob, EnvListItem, EnvOrigin, RunnerStatus};
+pub use vm::VmEnvConfig;
 
 /// The largest `sequence` any signed stream in this crate accepts (trust
 /// rotations, revocation lists, status reports): 2^53 - 1, the largest
